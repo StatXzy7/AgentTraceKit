@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.0 - 2026-09-15
+
+- Added `atk browse`, a loopback-only browser session picker with search, project/date filters, metadata preview, and one-click Collect & Review.
+
 ## 0.2.0 - 2026-09-15
 
 - Stable raw-line-derived event anchors and interaction IDs.

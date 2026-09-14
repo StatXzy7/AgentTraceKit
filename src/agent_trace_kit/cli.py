@@ -7,7 +7,7 @@ from .annotation import ensure_annotation_files
 from .corpus import index_corpus
 from .browse import serve
 from .verify import verify_bundle
-VERSION='0.2.0'
+VERSION='0.3.0'
 try: sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 except Exception: pass
 def _out_root(): return Path(os.environ.get('AGENT_TRACE_KIT_OUTPUT',Path.cwd()/'AgentTraceKit-output'))
