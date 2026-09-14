@@ -2,6 +2,7 @@ import csv, hashlib, json, os, re, shutil
 from pathlib import Path
 from datetime import datetime, timezone
 from .models import ParsedSession
+from .annotation import ensure_annotation_files
 
 def sha256(path):
     h=hashlib.sha256();
@@ -21,10 +22,10 @@ def create_bundle(source: Path, parsed: ParsedSession, output_root: Path) -> Pat
     interactions=[]; current=None
     for e in parsed.events:
         if e.event_type=='user_message':
-            current={'interaction_id':f"i{len(interactions)+1:04d}", 'provider':e.provider,'session_id':e.session_id,'user_message':e.data.get('text',''),'assistant_messages':[],'tool_calls':[],'tool_results':[],'source_lines':[e.source_line], 'completion_facts':[]}
+            current={'interaction_id':f"i_{e.event_id[2:]}", 'provider':e.provider,'session_id':e.session_id,'user_message':e.data.get('text',''),'assistant_messages':[],'tool_calls':[],'tool_results':[],'event_ids':[e.event_id],'source_lines':[e.source_line], 'completion_facts':[]}
             interactions.append(current)
         elif current:
-            current['source_lines'].append(e.source_line)
+            current['source_lines'].append(e.source_line); current['event_ids'].append(e.event_id)
             if e.event_type=='assistant_message': current['assistant_messages'].append(e.data.get('content') or e.data.get('text') or e.data.get('message') or e.data.get('reasoning_summary') or '')
             elif e.event_type=='tool_call': current['tool_calls'].append(e.data)
             elif e.event_type=='tool_result': current['tool_results'].append(e.data)
@@ -41,7 +42,8 @@ def create_bundle(source: Path, parsed: ParsedSession, output_root: Path) -> Pat
     with (out/'annotation/annotation_template.csv').open('w',encoding='utf-8-sig',newline='') as f:
         w=csv.writer(f); w.writerow(['interaction_id','provider','user_message','assistant_response_preview','tool_calls','source_lines','completion_facts','review_status','error_type','severity','attribution','notes'])
         for i in interactions: w.writerow([i['interaction_id'],i['provider'],i['user_message'], ' '.join(map(str,i['assistant_messages']))[:500],len(i['tool_calls']),','.join(map(str,i['source_lines'])),json.dumps(i['completion_facts'],ensure_ascii=False),'pending','','','',''])
-    manifest={'manifest_version':'1.0','provider':parsed.provider,'project':project_name(parsed),'session_id':parsed.session_id,'cwd':parsed.cwd,'timestamp':parsed.timestamp,'collection_time':datetime.now(timezone.utc).isoformat(),'source':{'name':source.name,'size':source.stat().st_size,'sha256':source_hash},'raw_copy':{'path':'raw/'+source.name,'size':raw_dest.stat().st_size,'sha256':sha256(raw_dest)},'event_count':len(parsed.events),'interaction_count':len(interactions),'parser_warning_count':len(parsed.warnings),'files':{}}
+    ensure_annotation_files(out)
+    manifest={'manifest_version':'1.1','provider':parsed.provider,'project':project_name(parsed),'session_id':parsed.session_id,'cwd':parsed.cwd,'timestamp':parsed.timestamp,'collection_time':datetime.now(timezone.utc).isoformat(),'source':{'name':source.name,'size':source.stat().st_size,'sha256':source_hash},'raw_copy':{'path':'raw/'+source.name,'size':raw_dest.stat().st_size,'sha256':sha256(raw_dest)},'event_count':len(parsed.events),'interaction_count':len(interactions),'parser_warning_count':len(parsed.warnings),'files':{}}
     for p in out.rglob('*'):
         if p.is_file() and p.name not in ('manifest.json','validation.json'): manifest['files'][str(p.relative_to(out)).replace('\\','/')]=sha256(p)
     (out/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
@@ -49,5 +51,10 @@ def create_bundle(source: Path, parsed: ParsedSession, output_root: Path) -> Pat
     (out/'validation.json').write_text(json.dumps(validation,ensure_ascii=False,indent=2),encoding='utf-8')
     (out/'README.txt').write_text(f"AgentTraceKit trajectory bundle\n\nThis folder is a portable copy of one Codex CLI session.\n\nraw/{source.name} is the untouched original JSONL bytes.\ntimeline.html is an offline readable report.\nannotation/annotation_template.csv is for human review.\nmanifest.json and validation.json record hashes and checks.\n\nPrivacy: review raw content before sharing or publishing.\n",encoding='utf-8')
     return out
+
+def refresh_manifest(bundle: Path):
+    mpath=bundle/'manifest.json'; m=json.loads(mpath.read_text(encoding='utf-8'))
+    m['files']={str(p.relative_to(bundle)).replace('\\','/'):sha256(p) for p in bundle.rglob('*') if p.is_file() and p.name not in ('manifest.json','validation.json')}
+    mpath.write_text(json.dumps(m,ensure_ascii=False,indent=2),encoding='utf-8')
 
 

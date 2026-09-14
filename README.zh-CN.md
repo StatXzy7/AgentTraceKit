@@ -11,4 +11,6 @@ atk
 
 运行 `atk doctor` 检查环境，`atk collect --latest` 自动采集最新 Codex 会话，`atk collect --input FILE` 可指定文件，`atk verify BUNDLE` 独立校验，`atk open` 打开报告。默认只读本机文件，不上传、不 telemetry。分享前请检查 raw 内容。
 
-v0.1.0 正式支持 Codex CLI；Claude Code、ZCode 和其他 Agent 计划支持。
+v0.2.0 正式支持 Codex CLI；Claude Code、ZCode 和其他 Agent 计划支持。
+
+使用 `atk view BUNDLE` 打开增强版离线 Viewer，使用 `atk annotate BUNDLE` 进入本地标注工作台。标注保存在 `annotation/annotations.jsonl`，并通过稳定的 event ID 和原始行号回溯证据。多个 bundle 可用 `atk corpus index DIRECTORY` 建立本地可重建索引。

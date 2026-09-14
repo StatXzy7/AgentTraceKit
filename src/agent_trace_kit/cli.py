@@ -1,10 +1,12 @@
 import argparse, os, sys, traceback, webbrowser
 from pathlib import Path
 from .adapters.codex import CodexAdapter, codex_home
-from .bundle import create_bundle
-from .html import render_timeline
+from .bundle import create_bundle, refresh_manifest
+from .html import render_timeline, render_annotation_workbench
+from .annotation import ensure_annotation_files
+from .corpus import index_corpus
 from .verify import verify_bundle
-VERSION='0.1.0'
+VERSION='0.2.0'
 try: sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 except Exception: pass
 def _out_root(): return Path(os.environ.get('AGENT_TRACE_KIT_OUTPUT',Path.cwd()/'AgentTraceKit-output'))
@@ -31,7 +33,7 @@ def collect(args):
  a=CodexAdapter(); discovered=a.discover_sessions(); source=Path(args.input).expanduser() if args.input else (discovered[0] if args.latest and discovered else choose(a))
  if not source: return 1
  if not source.exists(): print(f'✗ Input file not found: {source}'); return 1
- p=a.parse_session(source); out=create_bundle(source,p,Path(args.output or _out_root())); render_timeline(out)
+ p=a.parse_session(source); out=create_bundle(source,p,Path(args.output or _out_root())); render_timeline(out); render_annotation_workbench(out); refresh_manifest(out)
  i=a.inspect_session(source); print(f'✓ Collected\n  Provider: codex\n  Project: {Path(i.get("cwd") or "unknown").name}\n  Session id: {p.session_id}\n  Source: {source}\n  Timestamp: {p.timestamp or i.get("mtime")}\n  Bundle: {out}\n  Report: {out/"timeline.html"}')
  return 0
 def verify_cmd(path):
@@ -48,7 +50,7 @@ def guided():
  if n=='4': return verify_cmd(None)
  print('Use atk collect, atk doctor, atk verify PATH, or atk open [PATH].'); return 0
 def main(argv=None):
- ap=argparse.ArgumentParser(prog='atk'); sub=ap.add_subparsers(dest='cmd'); sub.add_parser('doctor'); c=sub.add_parser('collect'); c.add_argument('--latest',action='store_true'); c.add_argument('--input'); c.add_argument('--output'); v=sub.add_parser('verify'); v.add_argument('path'); o=sub.add_parser('open'); o.add_argument('path',nargs='?'); sub.add_parser('run'); args=ap.parse_args(argv)
+ ap=argparse.ArgumentParser(prog='atk'); sub=ap.add_subparsers(dest='cmd'); sub.add_parser('doctor'); c=sub.add_parser('collect'); c.add_argument('--latest',action='store_true'); c.add_argument('--input'); c.add_argument('--output'); v=sub.add_parser('verify'); v.add_argument('path'); o=sub.add_parser('open'); o.add_argument('path',nargs='?'); w=sub.add_parser('view'); w.add_argument('path'); an=sub.add_parser('annotate'); an.add_argument('path'); co=sub.add_parser('corpus'); co.add_argument('action',choices=['index']); co.add_argument('path'); sub.add_parser('run'); args=ap.parse_args(argv)
  try:
   if not args.cmd:return guided()
   if args.cmd=='doctor':doctor();return 0
@@ -58,6 +60,14 @@ def main(argv=None):
    p=Path(args.path) if args.path else max(_out_root().glob('*/timeline.html'),key=lambda x:x.stat().st_mtime,default=None)
    if not p: print('No bundle found. Run atk collect first.'); return 1
    webbrowser.open(p.resolve().as_uri()); print(f'✓ Opened {p}'); return 0
+  if args.cmd=='view':
+   p=Path(args.path); report=p/'timeline.html' if p.is_dir() else p
+   if not report.exists(): print(f'✗ Timeline not found: {report}'); return 1
+   webbrowser.open(report.resolve().as_uri()); print(f'✓ Opened {report}'); return 0
+  if args.cmd=='annotate':
+   p=Path(args.path); ensure_annotation_files(p); work=render_annotation_workbench(p); webbrowser.open(work.resolve().as_uri()); print(f'✓ Annotation workbench: {work}'); return 0
+  if args.cmd=='corpus':
+   if args.action=='index': db,n=index_corpus(Path(args.path)); print(f'✓ Indexed {n} bundles\n  SQLite index: {db}'); return 0
   if args.cmd=='run': print('atk run is reserved for a future safe Codex non-interactive adapter in v0.1.'); return 0
  except Exception as e:
   if '--debug' in (argv or sys.argv): traceback.print_exc()

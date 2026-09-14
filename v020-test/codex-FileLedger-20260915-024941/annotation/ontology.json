@@ -1,0 +1,35 @@
+{
+  "ontology_version": "0.1",
+  "labels": [
+    {
+      "name": "correct",
+      "description": "Meets the user's request"
+    },
+    {
+      "name": "incomplete",
+      "description": "Leaves a requested part unfinished"
+    },
+    {
+      "name": "tool_error",
+      "description": "Tool execution failed or returned an error"
+    },
+    {
+      "name": "tool_result_mismatch",
+      "description": "Tool output does not match the call"
+    },
+    {
+      "name": "unsupported_claim",
+      "description": "Response makes a claim without sufficient evidence"
+    },
+    {
+      "name": "other",
+      "description": "Other reviewer-defined issue"
+    }
+  ],
+  "review_statuses": [
+    "pending",
+    "accepted",
+    "rejected",
+    "needs_adjudication"
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "manifest_version": "1.1",
+  "provider": "codex",
+  "project": "FileLedger",
+  "session_id": "01a08fc3-bba4-7123-959c-a9a6af1f591d",
+  "cwd": "D:\\myprojects\\FileLedger",
+  "timestamp": "2026-09-11T09:19:43.479Z",
+  "collection_time": "2026-09-14T18:49:41.495891+00:00",
+  "source": {
+    "name": "fileledger_full_session.jsonl",
+    "size": 1447359,
+    "sha256": "4b829c12ccc075a6893ec8cb27fa686c069aeb34efa9777101c0eee038642356"
+  },
+  "raw_copy": {
+    "path": "raw/fileledger_full_session.jsonl",
+    "size": 1447359,
+    "sha256": "4b829c12ccc075a6893ec8cb27fa686c069aeb34efa9777101c0eee038642356"
+  },
+  "event_count": 269,
+  "interaction_count": 7,
+  "parser_warning_count": 0,
+  "files": {
+    "README.txt": "8165888375c8fe8bdb01197a9a6dcf843e69c4334808aad4e91bdb5f6fdbb488",
+    "timeline.html": "11688939734109c1ba7be3176bf4b5623e7483e1936d85618fbf74bcc778da3a",
+    "annotation/adjudication.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "annotation/annotations.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "annotation/annotation_template.csv": "6bd5a4d50faf1037230b343a9a6bcecf4c90fe1e85a88d5c8461a9285c937e89",
+    "annotation/ontology.json": "961c1dc1dbd2f80194839cf0287651473f32294d124a7c0c57d603eae5e7c933",
+    "annotation/workbench.html": "ec4d75f10a215e1ff8d2fcd1d0d7a65c775142c4a13ded1ab7739c94f257f2a3",
+    "evidence/evidence.csv": "dd1b809fec22181bd3f5438d7123e45f34b4ee048c8fbd0de0f8374496bda953",
+    "raw/fileledger_full_session.jsonl": "4b829c12ccc075a6893ec8cb27fa686c069aeb34efa9777101c0eee038642356",
+    "trajectory/events.jsonl": "fc65f357c11d8e9ac82e7d5eff7949d643830d83096180fed10fb9df7b3bcaad",
+    "trajectory/interactions.jsonl": "cd183cb0e783ba4c6534126368954dc9b4d52109452d90d5a1310c6cf49ad2a3"
+  }
+}

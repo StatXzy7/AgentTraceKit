@@ -1,4 +1,4 @@
-import json, os, re, shutil, subprocess
+import json, os, re, shutil, subprocess, hashlib
 from pathlib import Path
 from datetime import datetime
 from .base import AgentAdapter
@@ -92,6 +92,10 @@ class CodexAdapter(AgentAdapter):
                     elif it in ("reasoning","reasoning_summary"): et="assistant_message"; data={"reasoning_summary":item.get("summary") or item.get("text") or item}
                     else: et="unknown"; data=dict(item)
                 else: et="unknown"; data=dict(payload) if isinstance(payload,dict) else {"payload":payload}
-                idx+=1; events.append(NormalizedEvent("1.0","codex",sid,f"e{idx:06d}",stamp,et,str(path),line_no,typ,data))
+                idx+=1
+                # Stable across parser runs for the same raw line; annotations can safely anchor to it.
+                event_id="e_"+hashlib.sha256(f"{line_no}:{raw_no_nl}".encode("utf-8")).hexdigest()[:16]
+                data.setdefault("item_id", data.get("id")); data.setdefault("call_id", data.get("call_id"))
+                events.append(NormalizedEvent("1.1","codex",sid,event_id,stamp,et,str(path),line_no,typ,data))
         return ParsedSession("codex",sid,cwd,ts,cli,events,warnings,counts,users)
 

@@ -13,7 +13,11 @@ atk
 
 Or use `uv tool install agent-trace-kit`. `atk doctor` checks your local setup. `atk collect --latest` selects the newest Codex CLI session; `atk collect --input FILE` handles an explicit file. Bundles are local and include untouched raw bytes, normalized events, evidence, an annotation template, an offline HTML timeline, and independent verification. `atk verify BUNDLE` checks hashes and references. `atk open` opens the latest report.
 
-AgentTraceKit v0.1.0 supports **Codex CLI**. Claude Code, ZCode, and other agents are planned. This tool does not upload data or collect telemetry. Review raw trajectories before sharing them.
+AgentTraceKit v0.2.0 supports **Codex CLI**. Claude Code, ZCode, and other agents are planned. This tool does not upload data or collect telemetry. Review raw trajectories before sharing them.
+
+## Review and annotate
+
+`atk view BUNDLE` opens the enhanced offline viewer. `atk annotate BUNDLE` opens a local annotation workbench with a versioned ontology and exports `annotation/annotations.jsonl`. The raw session remains unchanged. To index a directory containing bundles for later search, run `atk corpus index DIRECTORY`; this creates a rebuildable local SQLite cache.
 
 ### Bundle files
 
