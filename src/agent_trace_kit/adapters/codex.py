@@ -22,7 +22,14 @@ class CodexAdapter(AgentAdapter):
     def discover_sessions(self):
         root = codex_home()/"sessions"
         if not root.exists(): return []
-        return sorted(root.rglob("rollout-*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+        files=list(root.rglob("rollout-*.jsonl"))
+        def sort_key(p):
+            m=re.search(r"rollout-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})", p.name)
+            if m:
+                try: return (1, datetime.strptime(m.group(1), "%Y-%m-%dT%H-%M-%S").timestamp())
+                except ValueError: pass
+            return (0, p.stat().st_mtime)
+        return sorted(files, key=sort_key, reverse=True)
     def inspect_session(self, path):
         info={"path":str(path),"mtime":datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="minutes"),"cwd":None,"session_id":None,"timestamp":None,"preview":None}
         try:
