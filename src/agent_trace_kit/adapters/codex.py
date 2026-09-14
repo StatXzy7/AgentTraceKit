@@ -68,7 +68,7 @@ class CodexAdapter(AgentAdapter):
                     mt=payload.get("type",""); textv=self._extract_user(rec)
                     if textv:
                         key=(textv, payload.get("id") or payload.get("message_id"));
-                        if textv==last_user_text and line_no-last_user_line<=2: continue
+                        if textv==last_user_text and line_no-last_user_line<=1: continue
                         seen_user.add(key); last_user_text,last_user_line=textv,line_no; users.append(textv); et="user_message"; data={"text":textv,**payload}
                     elif mt in ("task_complete","turn_complete","session_end","shutdown_complete"): et="lifecycle"; data=dict(payload)
                     elif "error" in mt or mt in ("task_failed","turn_failed"): et="lifecycle"; data=dict(payload)
@@ -77,7 +77,7 @@ class CodexAdapter(AgentAdapter):
                     item=payload.get("item") if isinstance(payload.get("item"),dict) else payload; it=str(item.get("type", "")); role=item.get("role")
                     if role=="user" or it=="user_message":
                         textv=_text(item.get("content") or item.get("text")); key=(textv,item.get("id"));
-                        if textv==last_user_text and line_no-last_user_line<=2: continue
+                        if textv==last_user_text and line_no-last_user_line<=1: continue
                         seen_user.add(key); last_user_text,last_user_line=textv,line_no; users.append(textv); et="user_message"; data=dict(item)
                     elif role=="assistant" or it in ("message","assistant_message"): et="assistant_message"; data=dict(item)
                     elif it in ("function_call","custom_tool_call","tool_call"): et="tool_call"; data=dict(item); pending[item.get("call_id") or item.get("id") or f"line-{line_no}"]=line_no
@@ -87,3 +87,4 @@ class CodexAdapter(AgentAdapter):
                 else: et="unknown"; data=dict(payload) if isinstance(payload,dict) else {"payload":payload}
                 idx+=1; events.append(NormalizedEvent("1.0","codex",sid,f"e{idx:06d}",stamp,et,str(path),line_no,typ,data))
         return ParsedSession("codex",sid,cwd,ts,cli,events,warnings,counts,users)
+
