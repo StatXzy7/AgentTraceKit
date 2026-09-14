@@ -5,6 +5,7 @@ from agent_trace_kit.bundle import create_bundle
 from agent_trace_kit.html import render_timeline, render_annotation_workbench
 from agent_trace_kit.verify import verify_bundle
 from agent_trace_kit.corpus import index_corpus
+from agent_trace_kit.browse import session_records
 
 def fixture(tmp_path):
  p=tmp_path/'rollout-test.jsonl'; lines=[{'timestamp':'2026-01-01T00:00:00Z','type':'session_meta','payload':{'session_id':'s1','cwd':'C:/demo','cli_version':'x'}},{'timestamp':'2026-01-01T00:00:01Z','type':'event_msg','payload':{'type':'user_message','message':'hello'}},{'timestamp':'2026-01-01T00:00:02Z','type':'response_item','payload':{'item':{'type':'message','role':'assistant','content':'<safe>'}}},{'timestamp':'2026-01-01T00:00:03Z','type':'response_item','payload':{'item':{'type':'function_call','call_id':'c1','name':'echo','arguments':'{}'}}},{'timestamp':'2026-01-01T00:00:04Z','type':'response_item','payload':{'item':{'type':'function_call_output','call_id':'c1','output':'ok'}}},{'type':'event_msg','payload':{'type':'task_complete'}},{'type':'new_future','payload':{'x':1}},'{bad']
@@ -31,3 +32,8 @@ def test_csv_formula_is_neutralized(tmp_path):
     p=tmp_path/'formula.jsonl'; p.write_text(json.dumps({'type':'event_msg','payload':{'type':'user_message','message':'=SUM(A1:A2)'}}),encoding='utf-8')
     parsed=CodexAdapter().parse_session(p); out=create_bundle(p,parsed,tmp_path/'out'); render_timeline(out); render_annotation_workbench(out)
     assert "'=SUM" in (out/'annotation/annotation_template.csv').read_text(encoding='utf-8-sig')
+
+def test_browser_metadata_is_lazy_and_human_friendly(tmp_path, monkeypatch):
+    home=tmp_path/'.codex'; (home/'sessions/2026/01/01').mkdir(parents=True)
+    p=home/'sessions/2026/01/01/rollout-2026-01-01T10-00-00-abc.jsonl'; p.write_text(json.dumps({'type':'session_meta','payload':{'session_id':'s','cwd':'C:/Demo'}})+'\n'+json.dumps({'type':'response_item','payload':{'type':'message','role':'user','content':[{'type':'input_text','text':'hello'}]}}),encoding='utf-8')
+    monkeypatch.setenv('CODEX_HOME',str(home)); rows=session_records(); assert rows[0]['session_id']=='s' and rows[0]['preview']=='hello'; assert rows[0]['size']>0

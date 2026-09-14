@@ -5,6 +5,7 @@ from .bundle import create_bundle, refresh_manifest
 from .html import render_timeline, render_annotation_workbench
 from .annotation import ensure_annotation_files
 from .corpus import index_corpus
+from .browse import serve
 from .verify import verify_bundle
 VERSION='0.2.0'
 try: sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -55,7 +56,7 @@ def guided():
  if n=='4': return verify_cmd(None)
  print('Use atk collect, atk doctor, atk verify PATH, or atk open [PATH].'); return 0
 def main(argv=None):
- ap=argparse.ArgumentParser(prog='atk'); sub=ap.add_subparsers(dest='cmd'); sub.add_parser('doctor'); c=sub.add_parser('collect'); c.add_argument('--latest',action='store_true'); c.add_argument('--input'); c.add_argument('--output'); v=sub.add_parser('verify'); v.add_argument('path'); o=sub.add_parser('open'); o.add_argument('path',nargs='?'); w=sub.add_parser('view'); w.add_argument('path'); an=sub.add_parser('annotate'); an.add_argument('path'); co=sub.add_parser('corpus'); co.add_argument('action',choices=['index']); co.add_argument('path'); sub.add_parser('run'); args=ap.parse_args(argv)
+ ap=argparse.ArgumentParser(prog='atk'); sub=ap.add_subparsers(dest='cmd'); sub.add_parser('doctor'); c=sub.add_parser('collect'); c.add_argument('--latest',action='store_true'); c.add_argument('--input'); c.add_argument('--output'); v=sub.add_parser('verify'); v.add_argument('path'); o=sub.add_parser('open'); o.add_argument('path',nargs='?'); w=sub.add_parser('view'); w.add_argument('path'); an=sub.add_parser('annotate'); an.add_argument('path'); br=sub.add_parser('browse'); br.add_argument('--port',type=int,default=0); br.add_argument('--no-browser',action='store_true'); co=sub.add_parser('corpus'); co.add_argument('action',choices=['index']); co.add_argument('path'); sub.add_parser('run'); args=ap.parse_args(argv)
  try:
   if not args.cmd:return guided()
   if args.cmd=='doctor':doctor();return 0
@@ -74,6 +75,7 @@ def main(argv=None):
    webbrowser.open(report.resolve().as_uri()); print(f'✓ Opened {report}'); return 0
   if args.cmd=='annotate':
    p=Path(args.path); ensure_annotation_files(p); work=render_annotation_workbench(p); webbrowser.open(work.resolve().as_uri()); print(f'✓ Annotation workbench: {work}'); return 0
+  if args.cmd=='browse': serve(_out_root(),args.port,not args.no_browser); return 0
   if args.cmd=='corpus':
    if args.action=='index': db,n=index_corpus(Path(args.path)); print(f'✓ Indexed {n} bundles\n  SQLite index: {db}'); return 0
   if args.cmd=='run': print('atk run is reserved for a future safe Codex non-interactive adapter in v0.1.'); return 0
