@@ -38,7 +38,12 @@ def collect(args):
  return 0
 def verify_cmd(path):
  if not path: path=input('Bundle path: ').strip()
- r=verify_bundle(Path(path)); print(('✓' if r['bundle_integrity']=='ok' else '✗')+f' bundle_integrity: {r["bundle_integrity"]}'); print(f'trajectory_parse_status: {r["trajectory_parse_status"]}\nagent_run_status: {r["agent_run_status"]}\ntask_success: {r["task_success"]}')
+ target=Path(path).expanduser()
+ if not target.exists():
+  print(f'✗ Bundle directory was not found: {target}')
+  print(f'  List available bundles with: Get-ChildItem "{_out_root()}" -Directory')
+  return 1
+ r=verify_bundle(target); print(('✓' if r.get('bundle_integrity')=='ok' else '✗')+f' bundle_integrity: {r.get("bundle_integrity","unknown")}'); print(f'trajectory_parse_status: {r.get("trajectory_parse_status","unknown")}\nagent_run_status: {r.get("agent_run_status","unknown")}\ntask_success: {r.get("task_success","unknown")}')
  for x in r.get('issues',[]): print('  ✗ '+x)
  return 0 if r['bundle_integrity']=='ok' else 1
 def guided():
@@ -62,7 +67,10 @@ def main(argv=None):
    webbrowser.open(p.resolve().as_uri()); print(f'✓ Opened {p}'); return 0
   if args.cmd=='view':
    p=Path(args.path); report=p/'timeline.html' if p.is_dir() else p
-   if not report.exists(): print(f'✗ Timeline not found: {report}'); return 1
+   if not report.exists():
+    print(f'✗ Timeline not found: {report}')
+    print(f'  List available bundles with: Get-ChildItem "{_out_root()}" -Directory')
+    return 1
    webbrowser.open(report.resolve().as_uri()); print(f'✓ Opened {report}'); return 0
   if args.cmd=='annotate':
    p=Path(args.path); ensure_annotation_files(p); work=render_annotation_workbench(p); webbrowser.open(work.resolve().as_uri()); print(f'✓ Annotation workbench: {work}'); return 0
