@@ -1,0 +1,16 @@
+name: release
+on:
+  workflow_dispatch:
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install pyinstaller .
+      - run: pyinstaller --clean --onefile --paths src --name agent-trace-kit entrypoint.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-trace-kit-windows-x64
+          path: dist/agent-trace-kit.exe

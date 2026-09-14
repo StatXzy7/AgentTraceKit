@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "agent-trace-kit"
+version = "0.1.0"
+description = "One command to turn coding-agent sessions into verifiable trajectory bundles."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+[project.scripts]
+agent-trace-kit = "agent_trace_kit.cli:main"
+atk = "agent_trace_kit.cli:main"
+[tool.setuptools.packages.find]
+where = ["src"]
