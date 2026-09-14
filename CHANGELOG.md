@@ -3,6 +3,7 @@
 ## 0.3.0 - 2026-09-15
 
 - Added `atk browse`, a loopback-only browser session picker with search, project/date filters, metadata preview, and one-click Collect & Review.
+- Added browser-only post-collection workspace with Overview, Timeline, Evidence, Annotation, Files, Verify, and return-to-sessions controls.
 
 ## 0.2.0 - 2026-09-15
 

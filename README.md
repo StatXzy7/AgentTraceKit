@@ -17,7 +17,7 @@ AgentTraceKit v0.2.0 supports **Codex CLI**. Claude Code, ZCode, and other agent
 
 ## Review and annotate
 
-`atk browse` opens a local browser session picker. Choose a session and click **Collect & Review**. `atk view BUNDLE` opens the enhanced offline viewer. `atk annotate BUNDLE` opens a local annotation workbench with a versioned ontology and exports `annotation/annotations.jsonl`. The raw session remains unchanged. To index a directory containing bundles for later search, run `atk corpus index DIRECTORY`; this creates a rebuildable local SQLite cache.
+`atk browse` opens a local browser session picker. Choose a session and click **Collect & Review**. The resulting browser workspace includes Overview, Timeline, Evidence, Annotation, Files, and a Verify button, so normal review requires no further command-line steps. `atk view BUNDLE` opens the same workspace directly. `atk annotate BUNDLE` remains available for opening the standalone annotation workbench. The raw session remains unchanged. To index a directory containing bundles for later search, run `atk corpus index DIRECTORY`; this creates a rebuildable local SQLite cache.
 
 ### Bundle files
 
