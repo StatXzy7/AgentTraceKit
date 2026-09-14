@@ -78,7 +78,7 @@ class CodexAdapter(AgentAdapter):
                     if role=="user" or it=="user_message":
                         textv=_text(item.get("content") or item.get("text")); key=(textv,item.get("id"));
                         if textv==last_user_text and line_no-last_user_line<=1: continue
-                        seen_user.add(key); last_user_text,last_user_line=textv,line_no; users.append(textv); et="user_message"; data=dict(item)
+                        seen_user.add(key); last_user_text,last_user_line=textv,line_no; users.append(textv); et="user_message"; data={"text":textv, **dict(item)}
                     elif role=="assistant" or it in ("message","assistant_message"): et="assistant_message"; data=dict(item)
                     elif it in ("function_call","custom_tool_call","tool_call"): et="tool_call"; data=dict(item); pending[item.get("call_id") or item.get("id") or f"line-{line_no}"]=line_no
                     elif it in ("function_call_output","custom_tool_call_output","tool_result","tool_output"): et="tool_result"; data=dict(item)
