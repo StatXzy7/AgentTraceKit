@@ -13,6 +13,10 @@ def sha256(path):
 def project_name(parsed):
     return Path(parsed.cwd).name if parsed.cwd else "unknown-project"
 
+def csv_safe(value):
+    text=str(value or '')
+    return "'"+text if text[:1] in ('=','+','-','@') else text
+
 def create_bundle(source: Path, parsed: ParsedSession, output_root: Path) -> Path:
     stamp=datetime.now().strftime('%Y%m%d-%H%M%S'); out=output_root/f"codex-{re.sub(r'[^A-Za-z0-9._-]+','-',project_name(parsed))}-{stamp}"; out.mkdir(parents=True,exist_ok=False)
     (out/'raw').mkdir(); (out/'trajectory').mkdir(); (out/'evidence').mkdir(); (out/'annotation').mkdir()
@@ -41,7 +45,7 @@ def create_bundle(source: Path, parsed: ParsedSession, output_root: Path) -> Pat
             w.writerow([e.event_id,iid,e.event_type,e.source_file,e.source_line,e.raw_type,source_hash])
     with (out/'annotation/annotation_template.csv').open('w',encoding='utf-8-sig',newline='') as f:
         w=csv.writer(f); w.writerow(['interaction_id','provider','user_message','assistant_response_preview','tool_calls','source_lines','completion_facts','review_status','error_type','severity','attribution','notes'])
-        for i in interactions: w.writerow([i['interaction_id'],i['provider'],i['user_message'], ' '.join(map(str,i['assistant_messages']))[:500],len(i['tool_calls']),','.join(map(str,i['source_lines'])),json.dumps(i['completion_facts'],ensure_ascii=False),'pending','','','',''])
+        for i in interactions: w.writerow([i['interaction_id'],i['provider'],csv_safe(i['user_message']), csv_safe(' '.join(map(str,i['assistant_messages']))[:500]),len(i['tool_calls']),','.join(map(str,i['source_lines'])),json.dumps(i['completion_facts'],ensure_ascii=False),'pending','','','',''])
     ensure_annotation_files(out)
     manifest={'manifest_version':'1.1','provider':parsed.provider,'project':project_name(parsed),'session_id':parsed.session_id,'cwd':parsed.cwd,'timestamp':parsed.timestamp,'collection_time':datetime.now(timezone.utc).isoformat(),'source':{'name':source.name,'size':source.stat().st_size,'sha256':source_hash},'raw_copy':{'path':'raw/'+source.name,'size':raw_dest.stat().st_size,'sha256':sha256(raw_dest)},'event_count':len(parsed.events),'interaction_count':len(interactions),'parser_warning_count':len(parsed.warnings),'files':{}}
     for p in out.rglob('*'):

@@ -26,3 +26,8 @@ def test_annotation_files_and_corpus_index(tmp_path):
     p=fixture(tmp_path); parsed=CodexAdapter().parse_session(p); out=create_bundle(p,parsed,tmp_path/'out'); render_timeline(out); render_annotation_workbench(out)
     db,count=index_corpus(tmp_path/'out'); assert db.exists() and count==1
     assert (out/'annotation/ontology.json').exists() and (out/'annotation/annotations.jsonl').exists()
+
+def test_csv_formula_is_neutralized(tmp_path):
+    p=tmp_path/'formula.jsonl'; p.write_text(json.dumps({'type':'event_msg','payload':{'type':'user_message','message':'=SUM(A1:A2)'}}),encoding='utf-8')
+    parsed=CodexAdapter().parse_session(p); out=create_bundle(p,parsed,tmp_path/'out'); render_timeline(out); render_annotation_workbench(out)
+    assert "'=SUM" in (out/'annotation/annotation_template.csv').read_text(encoding='utf-8-sig')
