@@ -7,4 +7,5 @@
 - **mkmkkkkk/compactdiff** and **masonc15/codex-transcript-viewer**: compact/dedicated transcript presentation. We prioritize raw preservation and verification.
 - **Datadog Labs trajectory**: observability/evaluation direction; outside this small local portable collector.
 
-These notes are orientation, not claims of feature parity. Current local Codex version observed during development: `codex-cli 0.151.0`.
+These notes are orientation, not claims of feature parity. Current local Codex version observed during development: `codex-cli 0.154.0-alpha.6.2`.
+
