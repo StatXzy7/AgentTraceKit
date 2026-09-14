@@ -3,11 +3,12 @@ from pathlib import Path
 from .bundle import sha256
 def verify_bundle(path: Path):
     issues=[]; mpath=path/'manifest.json'
-    required=['raw','trajectory/events.jsonl','trajectory/interactions.jsonl','evidence/evidence.csv','annotation/annotation_template.csv','annotation/ontology.json','annotation/annotations.jsonl','annotation/adjudication.jsonl','annotation/workbench.html','timeline.html','README.txt','validation.json']
-    for rel in required:
-        if not (path/rel).exists(): issues.append(f'missing required file: {rel}')
     if not mpath.exists(): return {'bundle_integrity':'invalid','issues':['manifest.json missing']}
     m=json.loads(mpath.read_text(encoding='utf-8'))
+    required=['raw','trajectory/events.jsonl','trajectory/interactions.jsonl','evidence/evidence.csv','annotation/annotation_template.csv','timeline.html','README.txt','validation.json']
+    if str(m.get('manifest_version','1.0')) >= '1.1': required += ['annotation/ontology.json','annotation/annotations.jsonl','annotation/adjudication.jsonl','annotation/workbench.html']
+    for rel in required:
+        if not (path/rel).exists(): issues.append(f'missing required file: {rel}')
     for rel,digest in m.get('files',{}).items():
         p=path/rel
         if not p.exists(): issues.append(f'missing file: {rel}')
