@@ -49,6 +49,7 @@ class CodexAdapter(AgentAdapter):
         return ""
     def parse_session(self, path):
         events=[]; warnings=[]; counts={}; users=[]; sid=path.stem; cwd=None; ts=None; cli=None; seen_user=set(); pending={}; idx=0
+        last_user_text=None; last_user_line=-100
         with path.open("r",encoding="utf-8-sig",errors="replace",newline="") as f:
             for line_no, raw in enumerate(f,1):
                 raw_no_nl=raw.rstrip("\r\n");
@@ -67,8 +68,8 @@ class CodexAdapter(AgentAdapter):
                     mt=payload.get("type",""); textv=self._extract_user(rec)
                     if textv:
                         key=(textv, payload.get("id") or payload.get("message_id"));
-                        if key in seen_user: continue
-                        seen_user.add(key); users.append(textv); et="user_message"; data={"text":textv,**payload}
+                        if textv==last_user_text and line_no-last_user_line<=2: continue
+                        seen_user.add(key); last_user_text,last_user_line=textv,line_no; users.append(textv); et="user_message"; data={"text":textv,**payload}
                     elif mt in ("task_complete","turn_complete","session_end","shutdown_complete"): et="lifecycle"; data=dict(payload)
                     elif "error" in mt or mt in ("task_failed","turn_failed"): et="lifecycle"; data=dict(payload)
                     else: et="unknown"; data=dict(payload)
@@ -76,8 +77,8 @@ class CodexAdapter(AgentAdapter):
                     item=payload.get("item") if isinstance(payload.get("item"),dict) else payload; it=str(item.get("type", "")); role=item.get("role")
                     if role=="user" or it=="user_message":
                         textv=_text(item.get("content") or item.get("text")); key=(textv,item.get("id"));
-                        if key in seen_user: continue
-                        seen_user.add(key); users.append(textv); et="user_message"; data=dict(item)
+                        if textv==last_user_text and line_no-last_user_line<=2: continue
+                        seen_user.add(key); last_user_text,last_user_line=textv,line_no; users.append(textv); et="user_message"; data=dict(item)
                     elif role=="assistant" or it in ("message","assistant_message"): et="assistant_message"; data=dict(item)
                     elif it in ("function_call","custom_tool_call","tool_call"): et="tool_call"; data=dict(item); pending[item.get("call_id") or item.get("id") or f"line-{line_no}"]=line_no
                     elif it in ("function_call_output","custom_tool_call_output","tool_result","tool_output"): et="tool_result"; data=dict(item)

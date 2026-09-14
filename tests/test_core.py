@@ -14,4 +14,8 @@ def test_parse_and_bundle(tmp_path):
  out=create_bundle(p,parsed,tmp_path/'out'); render_timeline(out); assert '<safe>' not in (out/'timeline.html').read_text(); assert verify_bundle(out)['bundle_integrity']=='ok'
 
 def test_unknown_and_malformed(tmp_path):
- parsed=CodexAdapter().parse_session(fixture(tmp_path)); assert any(e.event_type=='unknown' for e in parsed.events)
+    parsed=CodexAdapter().parse_session(fixture(tmp_path)); assert any(e.event_type=='unknown' for e in parsed.events)
+
+def test_repeated_user_text_is_not_globally_deduped(tmp_path):
+    p=tmp_path/'repeat.jsonl'; p.write_text('\n'.join([json.dumps({'type':'event_msg','payload':{'type':'user_message','message':'same'}}), json.dumps({'type':'response_item','payload':{'item':{'type':'message','role':'assistant','content':'ok'}}}), json.dumps({'type':'event_msg','payload':{'type':'user_message','message':'same'}})]), encoding='utf-8')
+    assert len(CodexAdapter().parse_session(p).user_messages)==2
