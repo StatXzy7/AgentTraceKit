@@ -13,7 +13,9 @@ atk
 
 Or use `uv tool install agent-trace-kit`. `atk doctor` checks your local setup. `atk collect --latest` selects the newest Codex CLI session; `atk collect --input FILE` handles an explicit file. Bundles are local and include untouched raw bytes, normalized events, evidence, an annotation template, an offline HTML timeline, and independent verification. `atk verify BUNDLE` checks hashes and references. `atk open` opens the latest report.
 
-AgentTraceKit v0.2.0 supports **Codex CLI**. Claude Code, ZCode, and other agents are planned. This tool does not upload data or collect telemetry. Review raw trajectories before sharing them.
+AgentTraceKit v0.4.0 supports **Codex CLI and Claude Code** imports. Observe collection is read-only; managed and WSL execution are explicit modes. Pair drafts, human GSB review, strict CSV export, and Windows PowerShell entry points are included. This tool does not upload data or collect telemetry. Review raw trajectories before sharing them.
+
+For the Windows collector workflow see [Windows Quickstart](docs/WINDOWS_QUICKSTART.md), [Configuration](docs/CONFIGURATION.md), and [Pairwise Workflow](docs/PAIRWISE_WORKFLOW.md). `atk demo --synthetic` creates two local fake sessions and a pair export without starting a real model or reading credentials.
 
 ## Review and annotate
 

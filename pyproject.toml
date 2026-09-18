@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 [project]
 name = "agent-trace-kit"
-version = "0.3.0"
+version = "0.4.0"
 description = "One command to turn coding-agent sessions into verifiable trajectory bundles."
 readme = "README.md"
 requires-python = ">=3.10"

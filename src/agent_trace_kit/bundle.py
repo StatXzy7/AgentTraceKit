@@ -18,7 +18,10 @@ def csv_safe(value):
     return "'"+text if text[:1] in ('=','+','-','@') else text
 
 def create_bundle(source: Path, parsed: ParsedSession, output_root: Path) -> Path:
-    stamp=datetime.now().strftime('%Y%m%d-%H%M%S'); out=output_root/f"codex-{re.sub(r'[^A-Za-z0-9._-]+','-',project_name(parsed))}-{stamp}"; out.mkdir(parents=True,exist_ok=False)
+    stamp=datetime.now().strftime('%Y%m%d-%H%M%S'); stem=f"{parsed.provider}-{re.sub(r'[^A-Za-z0-9._-]+','-',project_name(parsed))}-{stamp}"; out=output_root/stem
+    suffix=1
+    while out.exists(): out=output_root/f"{stem}-{suffix}"; suffix+=1
+    out.mkdir(parents=True,exist_ok=False)
     (out/'raw').mkdir(); (out/'trajectory').mkdir(); (out/'evidence').mkdir(); (out/'annotation').mkdir()
     raw_dest=out/'raw'/source.name; shutil.copyfile(source,raw_dest); source_hash=sha256(source)
     with (out/'trajectory/events.jsonl').open('w',encoding='utf-8',newline='\n') as f:

@@ -10,3 +10,8 @@ smoke-output*/
 AgentTraceKit-output/
 smoke-*/
 v020-*/
+# local atk configuration (may reference secret env names / endpoints)
+config.toml
+*.local.toml
+# pair desk local state
+desk-state/

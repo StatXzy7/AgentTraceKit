@@ -1,0 +1,5 @@
+task = "example-task"
+prompt = "Replace with the exact prompt used for both sides."
+difficulty = "困难"
+provider = "codex"
+mode = "observe"

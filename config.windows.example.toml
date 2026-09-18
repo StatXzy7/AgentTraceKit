@@ -1,0 +1,12 @@
+# Copy outside the repository and edit. Secrets are referenced by environment variable name only.
+data_root = "C:/AgentTraceKit-data"
+workspace_root = "C:/work"
+provider = "codex"
+mode = "observe"
+backend = "native"
+poll_interval_seconds = 2.0
+stable_window_seconds = 3.0
+archive_only_bound = true
+git_mode = "readonly"
+allow_push = false
+pairwise_policy = "pairwise_gsb_20260916"
