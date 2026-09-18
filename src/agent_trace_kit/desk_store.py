@@ -1,0 +1,188 @@
+"""File-backed persistence for the pair desk: settings, jobs and state recovery.
+
+Everything lives under one home directory (default C:/AgentTraceKit-data/desk),
+outside of any git repository. Writes are atomic so a crash mid-write cannot
+corrupt a job record.
+"""
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+import threading
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+DEFAULT_HOME = Path(os.environ.get("ATK_DESK_HOME", "C:/AgentTraceKit-data/desk"))
+
+_LOCK = threading.RLock()
+
+TASK_TYPES = ["0-1代码生成", "Feature迭代", "Bug修复", "代码理解", "代码重构", "工程化", "代码测试"]
+DIFFICULTIES = ["困难", "地狱"]
+CONCLUSIONS = ["A 更好", "Same", "B 更好"]
+
+DEFAULT_SETTINGS: dict[str, Any] = {
+    "claude_command": "claude",
+    "max_parallel_pairs": 2,
+    "side_timeout_seconds": 1800,
+    "oss_endpoint": "https://s3.cn-north-1.jdcloud-oss.com",
+    "oss_region": "cn-north-1",
+    "oss_bucket": "",
+    "oss_public_base": "",
+    "oss_key_prefix": "pairwise",
+    "workspace_copy_excludes": "",
+    "default_task_type": "0-1代码生成",
+    "default_difficulty": "困难",
+    "default_repro_level": "无外部依赖",
+    "reviewer": "",
+    "env_overrides": {},
+}
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+class DeskStore:
+    def __init__(self, home: str | Path = DEFAULT_HOME):
+        self.home = Path(home)
+        self.jobs_dir = self.home / "jobs"
+        self.workspaces = self.home / "workspaces"
+        self.evidence = self.home / "evidence"
+        self.settings_path = self.home / "settings.json"
+        self.secrets_path = self.home / "secrets.env"
+        for d in (self.home, self.jobs_dir, self.workspaces, self.evidence):
+            d.mkdir(parents=True, exist_ok=True)
+
+    # ---------- settings ----------
+    def settings(self) -> dict[str, Any]:
+        with _LOCK:
+            data = dict(DEFAULT_SETTINGS)
+            if self.settings_path.exists():
+                data.update(json.loads(self.settings_path.read_text(encoding="utf-8")))
+            return data
+
+    def save_settings(self, patch: dict[str, Any]) -> dict[str, Any]:
+        with _LOCK:
+            current = self.settings()
+            current.update({k: v for k, v in patch.items() if k in DEFAULT_SETTINGS or k in current})
+            self._atomic_write_json(self.settings_path, current)
+            return current
+
+    # ---------- jobs ----------
+    def job_path(self, job_id: str) -> Path:
+        return self.jobs_dir / f"{job_id}.json"
+
+    def create_job(self, data: dict[str, Any]) -> dict[str, Any]:
+        with _LOCK:
+            job_id = "pair-" + uuid.uuid4().hex[:10]
+            now = utc_now()
+            side = lambda name: {
+                "side": name, "status": "pending", "workspace": "", "branch": f"{job_id}-{name.lower()}",
+                "head_sha": "", "head_url": "", "session_id": "", "jsonl_local": "",
+                "trace_url": "", "video_local": "", "video_url": "",
+                "started_at": "", "finished_at": "", "exit_code": None, "error": "", "retry_of": "",
+            }
+            settings = self.settings()
+            job = {
+                "id": job_id,
+                "name": data.get("name") or job_id,
+                "prompt": data["prompt"],
+                "task_type": data.get("task_type") or settings["default_task_type"],
+                "difficulty": data.get("difficulty") or settings["default_difficulty"],
+                "stack": data.get("stack", ""),
+                "repro_level": data.get("repro_level") or settings["default_repro_level"],
+                "env_desc": data.get("env_desc", ""),
+                "check_commands": data.get("check_commands", ""),
+                "copy_excludes": data.get("copy_excludes", ""),
+                "baseline_repo": data.get("baseline_repo", ""),
+                "baseline_sha": "",
+                "baseline_url": "",
+                "harness": "Claude Code",
+                "harness_version": "",
+                "os_name": "Windows",
+                "status": "draft",
+                "created_at": now,
+                "updated_at": now,
+                "sides": {"A": side("A"), "B": side("B")},
+                "review": {"conclusion": "", "reason": "", "reviewer": "", "note": ""},
+                "uploads": {"A": {}, "B": {}},
+                "exported": False,
+            }
+            self._atomic_write_json(self.job_path(job_id), job)
+            return job
+
+    def get_job(self, job_id: str) -> dict[str, Any]:
+        with _LOCK:
+            return json.loads(self.job_path(job_id).read_text(encoding="utf-8"))
+
+    def list_jobs(self) -> list[dict[str, Any]]:
+        with _LOCK:
+            jobs = []
+            for p in self.jobs_dir.glob("*.json"):
+                try:
+                    jobs.append(json.loads(p.read_text(encoding="utf-8")))
+                except json.JSONDecodeError:
+                    continue
+            jobs.sort(key=lambda j: j.get("created_at", ""), reverse=True)
+            return jobs
+
+    def update_job(self, job_id: str, patch: dict[str, Any]) -> dict[str, Any]:
+        with _LOCK:
+            job = self.get_job(job_id)
+            for key, value in patch.items():
+                if key in ("id",):
+                    continue
+                job[key] = value
+            job["updated_at"] = utc_now()
+            self._atomic_write_json(self.job_path(job_id), job)
+            return job
+
+    def update_side(self, job_id: str, side_name: str, patch: dict[str, Any]) -> dict[str, Any]:
+        with _LOCK:
+            job = self.get_job(job_id)
+            side = job["sides"][side_name]
+            side.update(patch)
+            job["updated_at"] = utc_now()
+            self._atomic_write_json(self.job_path(job_id), job)
+            return job
+
+    def update_review(self, job_id: str, patch: dict[str, Any]) -> dict[str, Any]:
+        with _LOCK:
+            job = self.get_job(job_id)
+            review = job["review"]
+            for key in ("conclusion", "reason", "reviewer", "note"):
+                if key in patch:
+                    review[key] = patch[key]
+            job["updated_at"] = utc_now()
+            self._atomic_write_json(self.job_path(job_id), job)
+            return job
+
+    def evidence_dir(self, job_id: str) -> Path:
+        path = self.evidence / job_id
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def workspace_pair_dir(self, job_id: str) -> Path:
+        path = self.workspaces / job_id
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    # ---------- internals ----------
+    @staticmethod
+    def _atomic_write_json(path: Path, value: Any) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        text = json.dumps(value, ensure_ascii=False, indent=2)
+        fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise

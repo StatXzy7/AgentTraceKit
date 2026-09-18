@@ -1,4 +1,4 @@
-import argparse, json, os, sys, traceback, webbrowser
+import argparse, json, os, sys, tempfile, traceback, webbrowser
 from pathlib import Path
 from .adapters.codex import CodexAdapter
 from .adapters.claude import ClaudeAdapter
@@ -50,7 +50,7 @@ def pair_cmd(args):
   if args.action=='run' and args.dry_run: print(json.dumps({'dry_run':True,'provider':load_pair(p)['provider']})); return 0
   print(f'{args.action}: supported state operation requires explicit local inputs'); return 0
 def main(argv=None):
- ap=argparse.ArgumentParser(prog='atk'); sub=ap.add_subparsers(dest='cmd'); sub.add_parser('doctor'); c=sub.add_parser('collect'); c.add_argument('--provider',choices=['codex','claude'],default='codex'); c.add_argument('--latest',action='store_true'); c.add_argument('--input'); c.add_argument('--output'); v=sub.add_parser('verify'); v.add_argument('path'); op=sub.add_parser('open'); op.add_argument('path',nargs='?'); w=sub.add_parser('view'); w.add_argument('path'); an=sub.add_parser('annotate'); an.add_argument('path'); br=sub.add_parser('browse'); br.add_argument('--port',type=int,default=0); br.add_argument('--no-browser',action='store_true'); pu=sub.add_parser('pair-ui',help='AB目录检查、导出与Git上传'); pu.add_argument('--port',type=int,default=0); pu.add_argument('--no-browser',action='store_true'); pu.add_argument('--output'); co=sub.add_parser('corpus'); co.add_argument('action',choices=['index']); co.add_argument('path'); cf=sub.add_parser('config'); cf.add_argument('action',choices=['init','validate','show','explain']); cf.add_argument('key',nargs='?'); cf.add_argument('--path'); cf.add_argument('--redacted',action='store_true'); pa=sub.add_parser('pair'); pa.add_argument('action',choices=['create','prepare','watch','bind','collect','snapshot','check','record','attach-video','review-import','validate','export','publish','status','resume','run']); pa.add_argument('path',nargs='?'); pa.add_argument('--root'); pa.add_argument('--task',default=''); pa.add_argument('--prompt',default=''); pa.add_argument('--provider',choices=['codex','claude'],default='codex'); pa.add_argument('--difficulty',default=''); pa.add_argument('--side'); pa.add_argument('--session-id'); pa.add_argument('--bundle'); pa.add_argument('--review'); pa.add_argument('--output'); pa.add_argument('--strict',action='store_true'); pa.add_argument('--dry-run',action='store_true'); dm=sub.add_parser('demo'); dm.add_argument('--synthetic',action='store_true'); args=ap.parse_args(argv)
+ ap=argparse.ArgumentParser(prog='atk'); sub=ap.add_subparsers(dest='cmd'); sub.add_parser('doctor'); c=sub.add_parser('collect'); c.add_argument('--provider',choices=['codex','claude'],default='codex'); c.add_argument('--latest',action='store_true'); c.add_argument('--input'); c.add_argument('--output'); v=sub.add_parser('verify'); v.add_argument('path'); op=sub.add_parser('open'); op.add_argument('path',nargs='?'); w=sub.add_parser('view'); w.add_argument('path'); an=sub.add_parser('annotate'); an.add_argument('path'); br=sub.add_parser('browse'); br.add_argument('--port',type=int,default=0); br.add_argument('--no-browser',action='store_true'); pu=sub.add_parser('pair-ui',help='AB目录检查、导出与Git上传'); pu.add_argument('--port',type=int,default=0); pu.add_argument('--no-browser',action='store_true'); pu.add_argument('--output'); dk=sub.add_parser('desk',help='Pair 交付台：批量A/B自动跑、证据采集、OSS上传与TSV导出'); dk.add_argument('--port',type=int,default=8765); dk.add_argument('--no-browser',action='store_true'); co=sub.add_parser('corpus'); co.add_argument('action',choices=['index']); co.add_argument('path'); cf=sub.add_parser('config'); cf.add_argument('action',choices=['init','validate','show','explain']); cf.add_argument('key',nargs='?'); cf.add_argument('--path'); cf.add_argument('--redacted',action='store_true'); pa=sub.add_parser('pair'); pa.add_argument('action',choices=['create','prepare','watch','bind','collect','snapshot','check','record','attach-video','review-import','validate','export','publish','status','resume','run']); pa.add_argument('path',nargs='?'); pa.add_argument('--root'); pa.add_argument('--task',default=''); pa.add_argument('--prompt',default=''); pa.add_argument('--provider',choices=['codex','claude'],default='codex'); pa.add_argument('--difficulty',default=''); pa.add_argument('--side'); pa.add_argument('--session-id'); pa.add_argument('--bundle'); pa.add_argument('--review'); pa.add_argument('--output'); pa.add_argument('--strict',action='store_true'); pa.add_argument('--dry-run',action='store_true'); dm=sub.add_parser('demo'); dm.add_argument('--synthetic',action='store_true'); args=ap.parse_args(argv)
  try:
   if args.cmd=='doctor': doctor(); return 0
   if args.cmd=='collect': return collect(args)
@@ -63,9 +63,12 @@ def main(argv=None):
   if args.cmd=='annotate': p=Path(args.path); ensure_annotation_files(p); webbrowser.open(render_annotation_workbench(p).resolve().as_uri()); return 0
   if args.cmd=='browse': serve(_out_root(),args.port,not args.no_browser); return 0
   if args.cmd=='pair-ui': serve_pair_ui(args.port,not args.no_browser,args.output); return 0
+  if args.cmd=='desk':
+   from .desk import DeskServer
+   from .desk_store import DeskStore
+   DeskServer(DeskStore(),port=args.port).serve(open_browser=not args.no_browser); return 0
   if args.cmd=='corpus': db,n=index_corpus(Path(args.path)); print(f'✓ Indexed {n} bundles\n  SQLite index: {db}'); return 0
   if args.cmd=='demo':
-   import tempfile
    from datetime import datetime, timezone
    demo=Path(tempfile.mkdtemp(prefix='atk-demo-')); raw=[]
    for sid in ('synthetic-a','synthetic-b'):
