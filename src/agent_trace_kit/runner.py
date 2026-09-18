@@ -49,23 +49,53 @@ class PairRunner:
         self._lock = threading.RLock()
 
     # ---------- lifecycle ----------
+    def _reg_path(self, job_id: str, side_name: str) -> Path:
+        d = self.store.home / "running"
+        d.mkdir(parents=True, exist_ok=True)
+        return d / f"{job_id}__{side_name}.json"
+
+    def is_side_running(self, job_id: str, side_name: str) -> bool:
+        proc = self._procs.get(f"{job_id}/{side_name}")
+        return proc is not None and proc.poll() is None
+
     def recover(self) -> dict:
-        """Mark unfinished work after a crash so the UI shows retryable state."""
-        recovered = []
+        """Reap orphaned runs after a restart, then mark unfinished work retryable."""
+        from . import procmon
+        recovered: list[str] = []
+        killed: list[str] = []
+        running_dir = self.store.home / "running"
+        if running_dir.is_dir():
+            for reg in running_dir.glob("*.json"):
+                try:
+                    info = json.loads(reg.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    info = {}
+                pid = int(info.get("pid") or 0)
+                if pid:
+                    try:
+                        procmon.kill_tree(pid)
+                        killed.append(f"{info.get('job_id','?')}/{info.get('side','?')}")
+                    except Exception:
+                        pass
+                try:
+                    reg.unlink()
+                except OSError:
+                    pass
         for job in self.store.list_jobs():
             changed = False
             for side_name, side in job["sides"].items():
                 if side["status"] in ("preparing", "running", "collecting"):
                     self.store.update_side(job["id"], side_name, {
                         "status": "failed",
-                        "error": "进程中断，工作区状态未知，请重跑该侧（会从基线重新复制）",
+                        "error": ("交付台重启，已终止上次未完成的运行；点「重跑该侧」从基线重新执行"
+                                  + ("（旧进程已清理）" if any(x.startswith(f"{job['id']}/{side_name}") for x in killed) else "")),
                         "finished_at": _stamp(),
                     })
                     changed = True
                     recovered.append(f"{job['id']}/{side_name}")
             if job["status"] == "running":
                 self.store.update_job(job["id"], {"status": "ready" if changed else job["status"]})
-        return {"recovered": recovered}
+        return {"recovered": recovered, "orphans_killed": killed}
 
     def start(self) -> None:
         if self._workers:
@@ -189,90 +219,86 @@ class PairRunner:
 
         evidence_dir = self.store.evidence_dir(job_id)
         log_path = evidence_dir / f"{side_name.lower()}-run.log"
-
-        self.store.update_side(job_id, side_name, {"status": "running", "started_at": _stamp(), "error": ""})
-
-        env = dict(os.environ)
-        # Inherit the user's full environment: cc-switch and the global
-        # ~/.claude/settings.json (auto_model/urm, gateway, 1M context) are what
-        # the child claude.exe must use. This engine never selects a model.
-        # env_overrides in desk settings is reserved for rare explicit needs.
-        over = settings.get("env_overrides") or {}
-        env.update({str(k): str(v) for k, v in over.items()})
-
-        command = settings.get("claude_command", "claude")
+        max_attempts = max(1, int(settings.get("side_max_attempts", 6)))
+        stall_after = max(30, int(settings.get("stall_seconds", 240)))
+        poll_every = max(5, int(settings.get("activity_poll_seconds", 15)))
         timeout = int(settings.get("side_timeout_seconds", 1800))
-        prompt = job["prompt"]
-        args = [command, "-p", "--permission-mode", "acceptEdits", "--verbose"]
-        # short prompt via argv keeps the shell quoting trivial; long prompt via temp file + stdin
+
+        self.store.update_side(job_id, side_name, {
+            "status": "running", "started_at": _stamp(), "error": "", "attempts": 1,
+        })
+        log_path.write_text("", encoding="utf-8")
         started = time.time()
-        with log_path.open("w", encoding="utf-8") as logf:
-            logf.write(f"$ {' '.join(args)}  [prompt via {'argv' if len(prompt) < 1500 else 'stdin'}]\n\n")
-            logf.flush()
-            run_args = args
-            stdin_data = None
-            if len(prompt) < 1500:
-                run_args = args + [prompt]
-            else:
-                stdin_data = prompt
-            proc = subprocess.Popen(
-                run_args, cwd=wdir, env=env,
-                stdin=subprocess.PIPE if stdin_data is not None else None,
-                stdout=logf, stderr=subprocess.STDOUT,
-                text=True, encoding="utf-8", errors="replace",
+        result = None
+        attempts_log: list[str] = []
+        key = f"{job_id}/{side_name}"
+
+        for attempt in range(1, max_attempts + 1):
+            self._abort.discard(key)
+            if attempt > 1:
+                wait = min(30, 3 * attempt)
+                with log_path.open("a", encoding="utf-8") as f:
+                    f.write(f"\n\n=== 第 {attempt}/{max_attempts} 次尝试：重新复制干净工作区，{wait}s 后启动 ===\n")
+                self.store.update_side(job_id, side_name, {"attempts": attempt})
+                for _ in range(wait):
+                    if key in self._abort:
+                        break
+                    time.sleep(1)
+                if key in self._abort:
+                    break
+                # Fresh copy from the baseline so a retry cannot mix two sessions'
+                # edits into one product (single-turn evidence integrity).
+                try:
+                    self._fresh_workspace(job_id, side_name)
+                except Exception as exc:
+                    with log_path.open("a", encoding="utf-8") as f:
+                        f.write(f"[retry] 重新复制工作区失败：{exc}\n")
+            result = self._run_attempt(
+                job_id, side_name, wdir, evidence_dir, log_path,
+                timeout=timeout, stall_after=stall_after, poll_every=poll_every,
+                attempt=attempt,
             )
-            with self._lock:
-                self._procs[f"{job_id}/{side_name}"] = proc
-            try:
-                proc.communicate(input=stdin_data, timeout=timeout)
-                code = proc.returncode
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.communicate(timeout=30)
-                code = 124
-                logf.write(f"\n[TIMEOUT after {timeout}s]\n")
-            finally:
-                with self._lock:
-                    self._procs.pop(f"{job_id}/{side_name}", None)
+            attempts_log.append(result["summary"])
+            if result["aborted"]:
+                break
+            if result["code"] == 0 and result["new_session"]:
+                break
 
-        finished = _stamp()
-        patch = {"exit_code": code, "finished_at": finished, "duration_seconds": int(time.time() - started)}
-        aborted = f"{job_id}/{side_name}" in self._abort
+        result = result or {"code": -1, "new_session": None, "duration": 0,
+                            "aborted": False, "summary": "未执行"}
+        aborted = key in self._abort
         if aborted:
-            self._abort.discard(f"{job_id}/{side_name}")
+            self._abort.discard(key)
 
-        # collect the session that ran in this workspace, newest one created after side start
-        sessions = ws.find_session_jsonl(wdir)
-        if sessions and not aborted:
-            chosen = sessions[0]
+        patch = {
+            "exit_code": result["code"],
+            "finished_at": _stamp(),
+            "duration_seconds": int(time.time() - started),
+            "attempts_log": attempts_log,
+        }
+
+        chosen = None if aborted else result.get("new_session")
+        if chosen:
             kept = evidence_dir / f"{side_name.lower()}-{chosen['session_id']}.jsonl"
             shutil.copyfile(chosen["path"], kept)
             patch["session_id"] = chosen["session_id"]
             patch["jsonl_local"] = str(kept)
 
-        # auto commit + push the product
-        if not aborted and code in (0, 1):
+        if not aborted and result["code"] == 0 and chosen:
             try:
-                fin = ws.finalize_side(wdir, side["branch"], f"Pair {job_id} side {side_name} product")
+                fin = ws.finalize_side(wdir, side["branch"], f"Pair {job_id} side {side_name} product",
+                                       force=bool(side.get("retry_of")))
                 patch["head_sha"] = fin["sha"]
                 patch["head_url"] = fin["url"]
                 patch["pushed"] = True
             except ws.GitError as exc:
                 patch["error"] = f"产物提交/推送失败: {exc}"
-        else:
-            # even failed runs keep whatever commit exists (evidence of failure)
-            if not aborted:
-                sha = ws.head_sha(wdir)
-                if sha and ws.is_sha40(sha):
-                    try:
-                        ws.finalize_side(wdir, side["branch"], f"Pair {job_id} side {side_name} (failed run)")
-                        patch["head_sha"] = sha
-                        patch["head_url"] = ws.commit_permalink(wdir, sha)
-                        patch["pushed"] = True
-                    except ws.GitError:
-                        pass
+        elif not aborted:
+            # Incomplete rounds are discarded by the fresh-copy retry; a partial
+            # commit on the branch would be force-overwritten by the next attempt.
+            pass
 
-        # optional verification commands (build/test) — advisory, never blocks evidence
+        job = self.store.get_job(job_id)
         commands = [ln.strip() for ln in (job.get("check_commands") or "").splitlines() if ln.strip()]
         check_results = []
         if not aborted:
@@ -289,18 +315,221 @@ class PairRunner:
                 except OSError as exc:
                     check_results.append({"command": command_line, "exit_code": 127, "error": str(exc)})
         patch["check_results"] = check_results
+
         if aborted:
             patch["status"] = "failed"
             patch["error"] = "已手动中止，可重跑该侧"
-        elif code not in (0, 1):
+        elif result["code"] != 0:
+            why = "达到总超时" if result["code"] == 124 else f"claude 退出码={result['code']}（多为断流）"
+            tries = f"（已自动重试 {len(attempts_log)} 次仍未完成）" if len(attempts_log) > 1 else ""
             patch["status"] = "failed"
-            patch["error"] = (patch.get("error", "") + f" claude 退出码={code}，见 {log_path.name}").strip()
+            patch["error"] = (patch.get("error", "") + f" {why}{tries}，见 {log_path.name}").strip()
         elif not patch.get("session_id"):
             patch["status"] = "failed"
-            patch["error"] = "执行结束但没有在 ~/.claude/projects 找到该目录的会话记录"
+            patch["error"] = f"重试 {len(attempts_log)} 次后仍未产生完整的首轮会话（可能被断流截断），见 {log_path.name}"
         else:
             patch["status"] = "done"
         self.store.update_side(job_id, side_name, patch)
+
+    @staticmethod
+    def _pump_stream(proc: subprocess.Popen, logf, raw_path: Path, done: threading.Event) -> None:
+        """Read claude stream-json stdout: raw copy + a readable progress trace."""
+        seen: set[str] = set()
+
+        def emit(line: str) -> None:
+            key = line[:200]
+            if key in seen:
+                return
+            seen.add(key)
+            logf.write(line + "\n")
+            logf.flush()
+
+        try:
+            with raw_path.open("a", encoding="utf-8") as raw:
+                for line in proc.stdout:
+                    raw.write(line if line.endswith("\n") else line + "\n")
+                    try:
+                        ev = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    etype = ev.get("type")
+                    if etype == "result":
+                        emit(f"[result] {ev.get('subtype')} turns={ev.get('num_turns')} "
+                             f"cost=${ev.get('total_cost_usd')}\n{str(ev.get('result', ''))[:3000]}")
+                    elif etype == "assistant":
+                        msg = ev.get("message", {})
+                        blocks = msg.get("content", []) if isinstance(msg, dict) else []
+                        for b in blocks:
+                            if isinstance(b, dict) and b.get("type") == "tool_use":
+                                inp = json.dumps(b.get("input", {}), ensure_ascii=False)
+                                emit(f"tool {b.get('name', '?')} {inp[:280]}")
+                    elif etype == "user":
+                        msg = ev.get("message", {})
+                        content = msg.get("content", []) if isinstance(msg, dict) else []
+                        if isinstance(content, list):
+                            for c in content:
+                                if isinstance(c, dict) and c.get("type") == "tool_result":
+                                    body = c.get("content", "")
+                                    if isinstance(body, list):
+                                        body = " ".join(
+                                            x.get("text", "") for x in body if isinstance(x, dict)
+                                        )
+                                    mark = "TOOL-ERR" if c.get("is_error") else "tool-ok"
+                                    emit(f"{mark} {str(body).replace(chr(10), ' ')[:200]}")
+        except Exception:
+            pass
+        finally:
+            done.set()
+
+    def _run_attempt(
+        self, job_id: str, side_name: str, wdir: str, evidence_dir: Path, log_path: Path,
+        *, timeout: int, stall_after: int, poll_every: int, attempt: int,
+    ) -> dict:
+        """Launch claude once under a silent-stall watchdog; return attempt result."""
+        from . import procmon
+
+        settings = self.store.settings()
+        job = self.store.get_job(job_id)
+        prompt = job["prompt"]
+        env = dict(os.environ)
+        env.update({str(k): str(v) for k, v in (settings.get("env_overrides") or {}).items()})
+        command = settings.get("claude_command", "claude")
+        args = [command, "-p", "--permission-mode", "acceptEdits",
+                "--output-format", "stream-json", "--include-partial-messages",
+                "--verbose"]
+        stdin_data = None
+        if len(prompt) < 1500:
+            args.append(prompt)
+        else:
+            stdin_data = prompt
+
+        key = f"{job_id}/{side_name}"
+        baseline_mtime = self._latest_transcript_mtime(wdir)
+        t0 = time.time()
+        stalls = 0
+        killed_reason = ""
+
+        with log_path.open("a", encoding="utf-8") as logf:
+            if attempt == 1:
+                logf.write("$ claude -p --permission-mode acceptEdits --output-format stream-json  "
+                           f"[prompt via {'argv' if stdin_data is None else 'stdin'}]\n\n")
+            logf.flush()
+            raw_stream = evidence_dir / f"{side_name.lower()}-stream.jsonl"
+            proc = subprocess.Popen(
+                args, cwd=wdir, env=env,
+                stdin=subprocess.PIPE if stdin_data is not None else None,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace",
+                bufsize=1,
+            )
+            pump_done = threading.Event()
+            pump = threading.Thread(
+                target=self._pump_stream,
+                args=(proc, logf, raw_stream, pump_done),
+                daemon=True,
+            )
+            pump.start()
+            with self._lock:
+                self._procs[key] = proc
+            reg = self._reg_path(job_id, side_name)
+            reg.write_text(json.dumps({
+                "job_id": job_id, "side": side_name, "pid": proc.pid,
+                "workspace": wdir, "started": _stamp(),
+            }, ensure_ascii=False), encoding="utf-8")
+            prev_snap = procmon.snapshot()
+            idle_for = 0.0
+            code = None
+            try:
+                while True:
+                    if proc.poll() is not None:
+                        code = proc.returncode
+                        break
+                    for _ in range(poll_every):
+                        if proc.poll() is not None or key in self._abort:
+                            break
+                        time.sleep(1)
+                    if proc.poll() is not None:
+                        code = proc.returncode
+                        break
+                    if key in self._abort:
+                        procmon.kill_tree(proc.pid)
+                        proc.wait(timeout=30)
+                        killed_reason = "manual-abort"
+                        break
+                    if time.time() - t0 > timeout:
+                        procmon.kill_tree(proc.pid)
+                        proc.wait(timeout=30)
+                        killed_reason = "total-timeout"
+                        break
+                    cur_snap = procmon.snapshot()
+                    tree = procmon.descendants(proc.pid, cur_snap)
+                    cpu_io_busy = procmon.tree_busy(prev_snap, cur_snap, tree, proc.pid)
+                    new_transcript = self._latest_transcript_mtime(wdir) > baseline_mtime + 1
+                    idle_for = 0.0 if (cpu_io_busy or new_transcript) else idle_for + poll_every
+                    prev_snap = cur_snap
+                    if idle_for >= stall_after:
+                        stalls += 1
+                        logf.write(f"\n[watchdog] {int(idle_for)}s 无 CPU/IO/轨迹活动，判定网关断流，"
+                                   "终止本次尝试并自动重试\n")
+                        logf.flush()
+                        procmon.kill_tree(proc.pid)
+                        proc.wait(timeout=30)
+                        killed_reason = "stall"
+                        break
+            finally:
+                pump_done.wait(timeout=15)  # let the reader drain stdout before logf closes
+                with self._lock:
+                    self._procs.pop(key, None)
+                try:
+                    reg.unlink()
+                except OSError:
+                    pass
+        duration = int(time.time() - t0)
+        if killed_reason == "total-timeout":
+            code = 124
+        elif code is None:
+            code = -1
+        sessions = [] if killed_reason == "manual-abort" else [
+            s for s in ws.find_session_jsonl(wdir)
+            if float(s["mtime"]) >= baseline_mtime - 1
+            and ws.session_has_assistant(s["path"])
+            and ws.session_turn_complete(s["path"])
+        ]
+        new_session = sessions[0] if sessions else None
+        summary = f"#{attempt} exit={code} {duration}s stalls={stalls} {'有新会话' if new_session else '无新会话'}"
+        with log_path.open("a", encoding="utf-8") as logf:
+            logf.write(f"\n[attempt] {summary} killed={killed_reason or '-'}\n")
+        return {
+            "code": code, "new_session": new_session, "duration": duration,
+            "stalls": stalls, "aborted": killed_reason == "manual-abort",
+            "summary": summary,
+        }
+
+    @staticmethod
+    def _latest_transcript_mtime(wdir: str) -> float:
+        from . import procmon
+        config_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
+        return procmon.newest_jsonl_mtime(config_dir / "projects", ws._encode_cwd(wdir))
+
+
+    def _fresh_workspace(self, job_id: str, side_name: str) -> dict:
+        """Delete one side workspace and re-copy it from the baseline (retry)."""
+        job = self.store.get_job(job_id)
+        side = job["sides"][side_name]
+        wdir = side.get("workspace", "") or str(
+            self.store.workspace_pair_dir(job_id) / side_name.lower())
+        if Path(wdir).exists():
+            ws.robust_rmtree(wdir)
+        fresh = ws.prepare_side_workspace(
+            job["baseline_repo"], wdir, side["branch"], job.get("copy_excludes", ""),
+        )
+        self.store.update_side(job_id, side_name, {
+            "workspace": fresh["workspace"], "status": "pending", "error": "",
+            "head_sha": "", "head_url": "", "session_id": "", "jsonl_local": "",
+            "trace_url": "", "pushed": False, "exit_code": None,
+            "retry_of": side.get("head_sha") or "1",
+        })
+        return fresh
 
     def abort_side(self, job_id: str, side_name: str) -> None:
         """Terminate a running side; it lands as failed and can be re-copied/retried."""
@@ -313,18 +542,13 @@ class PairRunner:
                 raise RuntimeError(f"{side_name} 侧当前没有运行中的进程")
 
     def retry_side(self, job_id: str, side_name: str) -> None:
+        if self.is_side_running(job_id, side_name):
+            raise RuntimeError(
+                f"{side_name} 侧正在运行，不能重跑。请先点「中止」等它结束（状态变成失败/完成）后再重跑。"
+            )
         job = self.store.get_job(job_id)
         side = job["sides"][side_name]
         wdir = side.get("workspace", "") or str(self.store.workspace_pair_dir(job_id) / side_name.lower())
-        if Path(wdir).exists():
-            shutil.rmtree(wdir)
-        fresh = ws.prepare_side_workspace(
-            job["baseline_repo"], wdir, side["branch"], job.get("copy_excludes", ""),
-        )
-        self.store.update_side(job_id, side_name, {
-            "workspace": fresh["workspace"], "status": "pending", "error": "",
-            "head_sha": "", "head_url": "", "session_id": "", "jsonl_local": "",
-            "trace_url": "", "pushed": False, "exit_code": None,
-        })
+        self._fresh_workspace(job_id, side_name)
         self.store.update_job(job_id, {"status": "ready"})
         self.enqueue(job_id)

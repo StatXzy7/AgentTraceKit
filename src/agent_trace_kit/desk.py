@@ -14,7 +14,7 @@ from pathlib import Path
 from . import oss as oss_mod
 from . import workspace as ws
 from .checklist import run_checklist
-from .desk_store import CONCLUSIONS, DIFFICULTIES, TASK_TYPES, DeskStore
+from .desk_store import CONCLUSIONS, DIFFICULTIES, REPRO_LEVELS, TASK_TYPES, VALIDITY, DeskStore, clean_path
 from .export_tsv import HEADERS, export_tsv, job_row, upload_side
 from .recorder import Recorder
 from .runner import PairRunner
@@ -72,7 +72,7 @@ a{color:var(--blue)}
     <label>任务类型<select id="c_task_type"></select></label>
     <label>难度<select id="c_difficulty"></select></label>
     <label>语言/框架<input id="c_stack" placeholder="Go, Gin / Python, FastAPI"></label>
-    <label>环境可复现等级<input id="c_repro" value="无外部依赖"></label>
+    <label>环境可复现等级<select id="c_repro"></select></label>
     <label>运行环境说明<input id="c_env" placeholder="go version go1.26.0 linux/amd64（选填）"></label>
     <label>任务名（可选）<input id="c_name"></label>
   </div>
@@ -103,11 +103,14 @@ a{color:var(--blue)}
       <label>claude 命令<input id="s_claude"></label>
       <label>最多并行 pair 数<input id="s_parallel" type="number" min="1" max="6"></label>
       <label>单侧超时（秒）<input id="s_timeout" type="number"></label>
+    <label>断流判定（秒无活动）<input id="s_stall" type="number" min="30"></label>
+    <label>单侧最多自动重试次数<input id="s_attempts" type="number" min="1" max="20"></label>
       <label>OSS Endpoint<input id="s_endpoint"></label>
       <label>OSS 区域<input id="s_region"></label>
       <label>OSS Bucket<input id="s_bucket"></label>
       <label>公网访问基址（留空用 path-style）<input id="s_pubbase"></label>
       <label>对象 key 前缀<input id="s_prefix"></label>
+      <label>默认基线仓库<input id="s_baseline" placeholder="D:\work\my-task-repo"></label>
       <label>默认标注员<input id="s_reviewer"></label>
     </div>
   </div>
@@ -152,9 +155,11 @@ function sideStatus(s){const map={pending:"待运行",preparing:"准备中",runn
 
 async function loadSettings(){SETTINGS=await api("/api/settings_get");
   $("s_claude").value=SETTINGS.claude_command;$("s_parallel").value=SETTINGS.max_parallel_pairs;
-  $("s_timeout").value=SETTINGS.side_timeout_seconds;$("s_endpoint").value=SETTINGS.oss_endpoint;
+  $("s_timeout").value=SETTINGS.side_timeout_seconds;$("s_stall").value=SETTINGS.stall_seconds;
+  $("s_attempts").value=SETTINGS.side_max_attempts;$("s_endpoint").value=SETTINGS.oss_endpoint;
   $("s_region").value=SETTINGS.oss_region;$("s_bucket").value=SETTINGS.oss_bucket;
   $("s_pubbase").value=SETTINGS.oss_public_base;$("s_prefix").value=SETTINGS.oss_key_prefix;
+  $("s_baseline").value=SETTINGS.default_baseline_repo||"";
   $("s_reviewer").value=SETTINGS.reviewer;$("secretPath").textContent=SETTINGS.secret_path;
   const st=SETTINGS.oss;$("ossStatus").innerHTML=st.configured
     ?`已配置：${esc(st.endpoint)} / bucket=<b>${esc(st.bucket)}</b> / key=${esc(st.access_key_id_preview)}`
@@ -163,10 +168,15 @@ async function loadSettings(){SETTINGS=await api("/api/settings_get");
   fillSelect($("b_task_type"),__TASK_TYPES__,SETTINGS.default_task_type);
   fillSelect($("c_difficulty"),__DIFF__,SETTINGS.default_difficulty);
   fillSelect($("b_difficulty"),__DIFF__,SETTINGS.default_difficulty);
+  fillSelect($("c_repro"),__REPRO__,SETTINGS.default_repro_level);
+  $("c_baseline").value=$("c_baseline").value||SETTINGS.default_baseline_repo||"";
+  $("b_baseline").value=SETTINGS.default_baseline_repo||"";
 }
 async function saveSettings(){const body={claude_command:$("s_claude").value,max_parallel_pairs:+$("s_parallel").value,
- side_timeout_seconds:+$("s_timeout").value,oss_endpoint:$("s_endpoint").value,oss_region:$("s_region").value,
+ side_timeout_seconds:+$("s_timeout").value,stall_seconds:+$("s_stall").value,
+ side_max_attempts:+$("s_attempts").value,oss_endpoint:$("s_endpoint").value,oss_region:$("s_region").value,
  oss_bucket:$("s_bucket").value,oss_public_base:$("s_pubbase").value,oss_key_prefix:$("s_prefix").value,
+ default_baseline_repo:$("s_baseline").value,
  reviewer:$("s_reviewer").value};SETTINGS=await api("/api/settings_save",body);toast("设置已保存")}
 async function ossTest(){const x=await api("/api/oss_test",{endpoint:$("s_endpoint").value,region:$("s_region").value,bucket:$("s_bucket").value});
  toast(x.ok?("连接成功，bucket: "+(x.buckets||[]).join(", ")+(x.bucket_present?"（目标 bucket 存在）":"（目标 bucket 不存在，可点创建）")):("失败: "+x.error),!x.ok)}
@@ -221,6 +231,7 @@ function renderDetail(id){SEL=id;const j=JOBS.find(x=>x.id===id);if(!j)return;
       <button class="sec" onclick="act('enqueue')">② 开始/重试运行</button>
       <button class="ghost" onclick="refreshDetail()">↻ 刷新检查</button>
       <button class="ghost" onclick="act('collect')">重新采集会话</button>
+      <button class="ghost" style="margin-left:auto;color:#b91c1c" onclick="deleteJob()">删除任务（清理工作区和证据）</button>
     </div>
     <div class="grid" style="margin-top:8px">
       <div class="sidebox"><h3>🎥 A 侧录屏</h3>
@@ -242,7 +253,7 @@ function renderDetail(id){SEL=id;const j=JOBS.find(x=>x.id===id);if(!j)return;
         <input id="vB" value="${esc(j.sides.B.video_local||"")}" style="margin-top:6px" placeholder="也可直接粘贴 mp4 路径">
       </div>
     </div>
-    <p class="kv muted" style="margin:6px 2px">录主屏幕（含声音以外的全部画面），<b>90 秒自动停止</b>；录的是产物真实运行，失败也要录。录完点「保存录屏路径」再上传 OSS。</p>
+    <p class="kv muted" style="margin:6px 2px">录主屏幕（含声音以外的全部画面），<b>产物运行结束就点停止</b>，没有时长上限；失败也要录。录完点「保存录屏路径」再上传 OSS。</p>
     <div class="btns">
       <button class="sec" onclick="act('set_videos')">保存录屏路径</button>
       <button onclick="act('upload')">③ 上传轨迹+录屏到 OSS</button>
@@ -256,11 +267,12 @@ function renderDetail(id){SEL=id;const j=JOBS.find(x=>x.id===id);if(!j)return;
 
   <div class="card"><h3 style="margin-top:0">④ GSB 人工判断（严禁 AI 代写）</h3>
     <div class="grid3">
+      <label>有效性<select id="r_validity"><option value="">请选择</option>${__VALIDITY__.map(x=>`<option ${x===j.review.validity?"selected":""}>${x}</option>`).join("")}</select></label>
       <label>结论<select id="r_conclusion"><option value="">请选择</option>${__CONCLUSIONS__.map(x=>`<option ${x===j.review.conclusion?"selected":""}>${x}</option>`).join("")}</select></label>
       <label>标注员<input id="r_reviewer" value="${esc(j.review.reviewer||"")}"></label>
-      <label>备注<input id="r_note" value="${esc(j.review.note||"")}"></label>
     </div>
-    <label>GSB 理由（A、B 分别说明；Same 至少 80 字，其余 30 字以上）<textarea id="r_reason" style="min-height:140px">${esc(j.review.reason||"")}</textarea></label>
+    <label>备注（仅本工具内部导出，质检列留空）<input id="r_note" value="${esc(j.review.note||"")}"></label>
+    <label>GSB 理由（A、B 分别说明；Same 至少 80 字，其余 30 字以上；作废时可简述原因）<textarea id="r_reason" style="min-height:140px">${esc(j.review.reason||"")}</textarea></label>
     <div class="btns"><button onclick="saveReview()">保存 GSB</button>
     <button class="sec" onclick="exportRow()" ${c.ready?"":"disabled"}>⑤ 生成 TSV（全部绿灯后可用）</button></div>
     <div id="tsvBox" style="display:none;margin-top:10px">
@@ -280,7 +292,7 @@ function sideHtml(j,s){const x=j.sides[s];const run=x.status==="running";
   轨迹：${x.trace_url?`<a href="${esc(x.trace_url)}" target="_blank">链接</a>`:(x.jsonl_local?esc(x.jsonl_local.split("\\").pop()):"-")}<br>
   录屏：${x.video_url?`<a href="${esc(x.video_url)}" target="_blank">链接</a>`:(x.video_local?esc(x.video_local.split("\\").pop()):"缺失")}<br>
   ${x.error?`<span class="bad">${esc(x.error)}</span>`:""}</div>
-  <div class="btns"><button class="ghost" onclick="sideAct('retry','${s}')">重跑该侧</button>
+  <div class="btns"><button class="ghost" ${run?"disabled":""} title="${run?"运行中不能重跑，请先中止":""}" onclick="sideAct('retry','${s}')">重跑该侧</button>
   <button class="ghost" ${run?"":"disabled"} onclick="sideAct('abort','${s}')">中止</button>
   <button class="ghost" onclick="openLog('${s}')">运行日志</button></div></div>`}
 function checksHtml(items){if(!items||!items.length)return '<span class="muted">点「刷新检查」</span>';
@@ -289,10 +301,11 @@ function checksHtml(items){if(!items||!items.length)return '<span class="muted">
    `<span title="${esc(x.detail)}"><span class="dot ${x.ok?"g":x.blocking?"r":"y"}"></span><span class="${x.ok?"ok":x.blocking?"bad":"warn"}">${esc(x.label)}</span></span>`).join("　")}</div>`).join("")}
 function closeDetail(){$("detail").style.display="none";SEL=null}
 async function act(a){const body={job:SEL,action:a,video_a:$("vA")? $("vA").value:"",video_b:$("vB")?$("vB").value:""};
-  await api("/api/job_action",body);await refreshDetail()}
+  await api("/api/job_action",body);if(a==="delete"){closeDetail();await loadJobs();return}await refreshDetail()}
+async function deleteJob(){if(!confirm("确定删除该任务？将清理 A/B 工作区、证据文件和任务记录（已 push 的远端分支保留），不可恢复。"))return;await act("delete");toast("任务已删除")}
 async function sideAct(a,s){await api("/api/side_action",{job:SEL,side:s,action:a});await refreshDetail()}
 async function refreshDetail(online){const j=await api("/api/job",{id:SEL,online:!!online});const f=JOBS.findIndex(x=>x.id===SEL);if(f>=0)JOBS[f]=j;renderRows();renderDetail(SEL)}
-async function saveReview(){await api("/api/review",{job:SEL,conclusion:$("r_conclusion").value,reason:$("r_reason").value,reviewer:$("r_reviewer").value,note:$("r_note").value});toast("GSB 已保存");refreshDetail()}
+async function saveReview(){await api("/api/review",{job:SEL,validity:$("r_validity").value,conclusion:$("r_conclusion").value,reason:$("r_reason").value,reviewer:$("r_reviewer").value,note:$("r_note").value});toast("GSB 已保存");refreshDetail()}
 async function exportRow(){const x=await api("/api/export",{job:SEL});$("tsvBox").style.display="block";$("tsvPre").textContent=x.tsv;window.__tsv=x.tsv}
 function copyTsv(){navigator.clipboard.writeText(window.__tsv||"");toast("已复制，去飞书表格粘贴（整行）")}
 function downloadTsv(){const b=new Blob([window.__tsv||""],{type:"text/tab-separated-values"});const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download=SEL+".tsv";a.click()}
@@ -308,7 +321,7 @@ async function recRefresh(s){
   const el=$("rec"+s);if(!el)return;
   if(x.recording){
     const btn=$("recStop"+s);if(btn)btn.disabled=false;
-    el.innerHTML=`🔴 录制中 <b>${x.elapsed}s</b> / ${x.max}s（到点自动停止并保存）`;
+    el.innerHTML=`🔴 录制中 <b>${x.elapsed}s</b>（运行结束点「停止并保存」）`;
     el.className="kv bad";
     recTimers[s]=setInterval(()=>recRefresh(s),1000);
   }else{
@@ -323,12 +336,43 @@ pollTimer=setInterval(()=>{if(JOBS.some(j=>["running","ready"].includes(j.status
 </script></body></html>"""
 
 
+class _ExclusiveServer(ThreadingHTTPServer):
+    # On Windows SO_REUSEADDR lets two processes bind the same port; refuse it so
+    # a second desk fails loudly instead of silently double-running every job.
+    allow_reuse_address = False
+    daemon_threads = True
+
+
 class DeskServer:
     def __init__(self, store: DeskStore, port: int = 8765):
         self.store = store
         self.runner = PairRunner(store)
         self.recorder = Recorder(store)
         self.port = port
+        self._lock_fp = None
+
+    def _acquire_singleton_lock(self) -> bool:
+        """Cross-process exclusive lock; False when another desk owns it."""
+        import sys
+        lock_path = self.store.home / "desk.lock"
+        fp = open(lock_path, "a+", encoding="utf-8")
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+                fp.seek(0)
+                msvcrt.locking(fp.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fp.seek(0)
+            fp.truncate()
+            fp.write(str(__import__("os").getpid()))
+            fp.flush()
+            self._lock_fp = fp
+            return True
+        except (OSError, ValueError):
+            fp.close()
+            return False
 
     def oss_cfg(self, overrides: dict | None = None) -> oss_mod.OssConfig | None:
         settings = dict(self.store.settings())
@@ -359,7 +403,7 @@ class DeskServer:
         created: list[str] = []
         prepared: list[str] = []
         errors: list[str] = []
-        default_baseline = (body.get("baseline_repo") or "").strip()
+        default_baseline = clean_path(body.get("baseline_repo", ""))
         for raw in _io.StringIO(body.get("lines", "")):
             line = raw.rstrip("\n").rstrip("\r")
             if not line.strip():
@@ -418,6 +462,25 @@ class DeskServer:
                     k: v for k, v in urls.items() if k.endswith("url")
                 })
             return {"uploaded": True}
+        if action == "delete":
+            for side_name in ("A", "B"):
+                try:
+                    self.runner.abort_side(job_id, side_name)
+                except Exception:
+                    pass
+            job = self.store.get_job(job_id)
+            for side_name in ("A", "B"):
+                wdir = job["sides"][side_name].get("workspace", "")
+                if wdir:
+                    ws.robust_rmtree(wdir)
+            pair_dir = self.store.workspaces / job_id
+            if pair_dir.exists():
+                ws.robust_rmtree(pair_dir)
+            ev_dir = self.store.evidence / job_id
+            if ev_dir.exists():
+                ws.robust_rmtree(ev_dir)
+            self.store.delete_job(job_id)
+            return {"deleted": True}
         raise RuntimeError(f"未知操作 {action}")
 
     def _recollect_side(self, job_id: str, side_name: str) -> None:
@@ -482,7 +545,9 @@ class DeskServer:
                 if path == "/":
                     data = PAGE.replace("__TASK_TYPES__", json.dumps(TASK_TYPES, ensure_ascii=False)) \
                               .replace("__DIFF__", json.dumps(DIFFICULTIES, ensure_ascii=False)) \
-                              .replace("__CONCLUSIONS__", json.dumps(CONCLUSIONS, ensure_ascii=False))
+                              .replace("__CONCLUSIONS__", json.dumps(CONCLUSIONS, ensure_ascii=False)) \
+                              .replace("__VALIDITY__", json.dumps(VALIDITY, ensure_ascii=False)) \
+                              .replace("__REPRO__", json.dumps(REPRO_LEVELS, ensure_ascii=False))
                     raw = data.encode("utf-8")
                     self.send_response(200)
                     self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -565,9 +630,18 @@ class DeskServer:
         )
         return {"path": p.stdout.strip()}
 
-    def serve(self, open_browser: bool = True) -> None:
+    def serve(self, open_browser: bool = True) -> int:
+        # 1) single-instance lock, 2) bind port — both BEFORE any recovery/run,
+        # so a duplicate launch cannot mutate state or spawn extra claude runs.
+        if not self._acquire_singleton_lock():
+            print(f"已有一个 Pair 交付台在运行（占用数据目录 {self.store.home}），本次启动退出。")
+            return 2
+        try:
+            httpd = _ExclusiveServer(("127.0.0.1", self.port), self.make_handler())
+        except OSError as exc:
+            print(f"端口 {self.port} 已被占用，交付台可能已在运行：{exc}")
+            return 2
         self.runner.start()
-        httpd = ThreadingHTTPServer(("127.0.0.1", self.port), self.make_handler())
         url = f"http://127.0.0.1:{self.port}/"
         if open_browser:
             threading.Timer(0.6, lambda: webbrowser.open(url)).start()
@@ -580,6 +654,12 @@ class DeskServer:
             self.runner.stop()
             self.recorder.stop_all()
             httpd.server_close()
+            if self._lock_fp:
+                try:
+                    self._lock_fp.close()
+                except OSError:
+                    pass
+        return 0
 
 
 def main(argv=None) -> int:
@@ -588,8 +668,7 @@ def main(argv=None) -> int:
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--no-browser", action="store_true")
     args = ap.parse_args(argv)
-    DeskServer(DeskStore(), port=args.port).serve(open_browser=not args.no_browser)
-    return 0
+    return DeskServer(DeskStore(), port=args.port).serve(open_browser=not args.no_browser)
 
 
 if __name__ == "__main__":

@@ -12,13 +12,15 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from .desk_store import CONCLUSIONS, DIFFICULTIES, TASK_TYPES
+from .desk_store import CONCLUSIONS, DIFFICULTIES, REPRO_LEVELS, TASK_TYPES, VALIDITY
 from . import workspace as ws
 
 SHA_URL = re.compile(r"^https://[\w.-]+/[^/]+/[^/]+/commit/[0-9a-f]{40}$")
 URL_RE = re.compile(r"^https?://")
 
-VIDEO_MAX_SECONDS = 90.0
+# Videos run until the product demo ends; duration is recorded for information
+# only and no longer blocks export (previously a hard 90-second cap).
+VIDEO_RECORD_SECONDS = None
 
 
 def video_duration_seconds(path: str | Path) -> float | None:
@@ -151,15 +153,13 @@ def _side_checks(items: list, job: dict, side_name: str, online: bool) -> None:
     if video_local and Path(video_local).is_file():
         size_mb = Path(video_local).stat().st_size / 1024 / 1024
         dur = video_duration_seconds(video_local)
-        dur_ok = dur is None or dur <= VIDEO_MAX_SECONDS
         detail = f"{size_mb:.1f} MB"
         if dur is not None:
-            detail += f"，时长 {dur:.0f}s"
-            detail += "（≤90s 合规）" if dur_ok else "（超过规范 90 秒上限，请重录）"
-        _check(items, f"{side_name}_video_duration", group, "录屏时长 ≤ 90 秒", dur_ok, detail,
-               blocking=dur is not None and not dur_ok)
+            detail += f"，时长 {dur:.0f}s（录到运行结束即可）"
+        _check(items, f"{side_name}_video_duration", group, "录屏可正常读取时长", dur is not None or bool(URL_RE.match(video_url)),
+               detail, blocking=False)
     if video_url and not video_local:
-        _check(items, f"{side_name}_video_size", group, "录屏文件", True, "已上传（本地未留文件，时长请自行确认 ≤90s）",
+        _check(items, f"{side_name}_video_size", group, "录屏文件", True, "已上传（本地未留文件）",
                blocking=False)
     if online and URL_RE.match(trace_url):
         from . import oss
@@ -172,8 +172,12 @@ def _side_checks(items: list, job: dict, side_name: str, online: bool) -> None:
                    f"HTTP {hv.get('status')} {hv.get('error', '')}".strip(), blocking=False)
 
     if side.get("status") == "failed":
+        # A pair declared void (e.g. engineering failure) is still exported for
+        # audit with whatever evidence exists, so a failed run does not block it.
+        voided = job.get("review", {}).get("validity", "") not in ("", "有效")
         _check(items, f"{side_name}_run", group, "本次执行成功结束", False,
-               side.get("error", "执行失败") + "（失败也必须保留证据；可重跑该侧）")
+               side.get("error", "执行失败") + "（失败也必须保留证据；可重跑该侧）",
+               blocking=not voided)
 
 
 def run_checklist(job: dict, *, online: bool = False) -> dict:
@@ -192,10 +196,8 @@ def run_checklist(job: dict, *, online: bool = False) -> dict:
     _check(items, "harness_version", "环境", "Harness 版本", bool(job.get("harness_version")),
            job.get("harness_version", "") or "准备任务时自动采集")
     _check(items, "os", "环境", "操作系统", bool(job.get("os_name")), job.get("os_name", ""))
-    _check(items, "repro", "环境", "环境可复现等级", bool(job.get("repro_level")),
-           job.get("repro_level", "") or "选填")
-    if not job.get("repro_level"):
-        items[-1]["blocking"] = False
+    _check(items, "repro", "环境", "环境可复现等级", job.get("repro_level") in REPRO_LEVELS,
+           job.get("repro_level", "") or "缺失")
 
     baseline_sha = job.get("baseline_sha", "")
     _check(items, "baseline_sha", "初始快照", "40 位完整 SHA", ws.is_sha40(baseline_sha),
@@ -221,14 +223,22 @@ def run_checklist(job: dict, *, online: bool = False) -> dict:
                a["head_sha"] != b["head_sha"], "两个不同 SHA（同 SHA 需在备注说明）", blocking=False)
 
     review = job.get("review", {})
-    _check(items, "conclusion", "GSB", "结论（A 更好 / Same / B 更好）",
-           review.get("conclusion") in CONCLUSIONS, review.get("conclusion", "") or "未选择")
+    validity = review.get("validity", "")
+    _check(items, "validity", "GSB", "有效性（有效 / 作废-…）",
+           validity in VALIDITY, validity or "未选择")
+    # A voided pair is recorded for audit but excluded from evaluation, so the
+    # preference judgement is not required; for a valid pair it blocks export.
+    is_valid_pair = validity == "有效"
+    _check(items, "conclusion", "GSB", "GSB 结论（A 更好 / Same / B 更好）",
+           review.get("conclusion") in CONCLUSIONS, review.get("conclusion", "") or "未选择",
+           blocking=is_valid_pair)
     reason = review.get("reason", "").strip()
     min_len = 80 if review.get("conclusion") == "Same" else 30
     reason_ok = len(reason) >= min_len
     _check(items, "reason", "GSB",
            f"理由（至少 {min_len} 字，Same 需更详细）", reason_ok,
-           f"{len(reason)} 字" if reason else "未填写")
+           f"{len(reason)} 字" if reason else "未填写",
+           blocking=is_valid_pair and review.get("conclusion") in CONCLUSIONS)
     _check(items, "reviewer", "GSB", "标注员", bool(review.get("reviewer", "").strip()),
            review.get("reviewer", "") or "缺失", blocking=False)
 

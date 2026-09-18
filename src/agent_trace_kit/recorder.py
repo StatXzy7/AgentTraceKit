@@ -1,8 +1,8 @@
 """Built-in screen recording for product-demo videos.
 
 Uses ffmpeg gdigrab (Windows, primary monitor) so no third-party recorder is
-needed. A hard ``-t 90`` cap enforces the spec's 90-second limit even if the
-browser/server goes away; graceful 'q' shutdown finalises the mp4 properly.
+needed. Recording runs until the operator presses stop (graceful 'q' shutdown
+finalises the mp4) — demos are only as long as the real product run.
 """
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ from pathlib import Path
 from .checklist import video_duration_seconds
 from .desk_store import DeskStore
 
-MAX_SECONDS = 90
 DEFAULT_FPS = 15
 
 
@@ -32,7 +31,7 @@ class Recorder:
     def _video_path(self, job_id: str, side: str) -> Path:
         return self.store.evidence_dir(job_id) / f"{side.lower()}-video.mp4"
 
-    def start(self, job_id: str, side: str, *, fps: int = DEFAULT_FPS, max_seconds: int = MAX_SECONDS) -> dict:
+    def start(self, job_id: str, side: str, *, fps: int = DEFAULT_FPS) -> dict:
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
             raise RuntimeError("未找到 ffmpeg，请先安装或改用「选择…」绑定已有录屏文件")
@@ -48,7 +47,6 @@ class Recorder:
             out.unlink()
         cmd = [
             ffmpeg, "-y", "-f", "gdigrab", "-framerate", str(fps), "-i", "desktop",
-            "-t", str(max_seconds),
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
             "-pix_fmt", "yuv420p", "-movflags", "+faststart",
             str(out),
@@ -58,7 +56,7 @@ class Recorder:
             cmd, stdin=subprocess.PIPE, stdout=logf, stderr=subprocess.STDOUT,
             creationflags=creationflags,
         )
-        rec = {"proc": proc, "path": out, "started": time.time(), "max": max_seconds, "logf": logf}
+        rec = {"proc": proc, "path": out, "started": time.time(), "logf": logf}
         with self._lock:
             self._recs[key] = rec
 
@@ -71,7 +69,7 @@ class Recorder:
             self._save(job_id, side, out)
 
         threading.Thread(target=_watch, daemon=True).start()
-        return {"recording": True, "path": str(out), "max_seconds": max_seconds}
+        return {"recording": True, "path": str(out)}
 
     def _save(self, job_id: str, side: str, out: Path) -> dict:
         with self._lock:
@@ -123,7 +121,6 @@ class Recorder:
             return {
                 "recording": True,
                 "elapsed": int(time.time() - rec["started"]),
-                "max": rec["max"],
                 "path": str(out),
             }
         return {

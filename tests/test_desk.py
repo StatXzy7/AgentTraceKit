@@ -54,7 +54,7 @@ def test_store_create_update_and_crash_recovery(tmp_path):
     PairRunner(store).recover()
     recovered = store.get_job(job["id"])
     assert recovered["sides"]["A"]["status"] == "failed"
-    assert "中断" in recovered["sides"]["A"]["error"]
+    assert "重跑" in recovered["sides"]["A"]["error"]
     assert len(store.list_jobs()) == 1
 
 
@@ -112,6 +112,14 @@ def test_find_session_jsonl_by_cwd(tmp_path, monkeypatch):
     assert p.exists()
 
 
+def test_clean_path_strips_wrapping_quotes():
+    from agent_trace_kit.desk_store import clean_path
+    assert clean_path(r'"D:\myprojects\repo"') == r"D:\myprojects\repo"
+    assert clean_path(r"'D:\myprojects\repo'") == r"D:\myprojects\repo"
+    assert clean_path("  D:\\x  ") == "D:\\x"
+    assert clean_path("") == ""
+
+
 def test_checklist_blocks_then_passes(tmp_path, baseline_repo, monkeypatch):
     store = DeskStore(tmp_path / "desk")
     job = store.create_job({
@@ -162,7 +170,7 @@ def test_checklist_blocks_then_passes(tmp_path, baseline_repo, monkeypatch):
         "baseline_url": f"https://github.com/org/repo/commit/{snap['sha']}",
         "baseline_pushed": True, "harness_version": "2.1.260",
     })
-    job = store.update_review(job["id"], {"conclusion": "A 更好", "reason": "A 恢复路径无死锁，" * 5, "reviewer": "Vincent"})
+    job = store.update_review(job["id"], {"validity": "有效", "conclusion": "A 更好", "reason": "A 恢复路径无死锁，" * 5, "reviewer": "Vincent"})
     report = cl.run_checklist(job)
     blockers = [x["id"] for x in report["items"] if x["blocking"] and not x["ok"]]
     assert blockers == [], blockers
@@ -174,10 +182,34 @@ def test_export_tsv_headers_and_strict_gate(tmp_path):
     job = store.create_job({"prompt": "p"})
     with pytest.raises(ValueError):
         export_tsv.export_tsv(job, tmp_path / "x.tsv", strict=True)
-    # header row always has the 20 spec columns
-    assert len(export_tsv.HEADERS) == 20
+    # header row always has the 23 spec columns, in submission-template order
+    assert len(export_tsv.HEADERS) == 23
     assert export_tsv.HEADERS[0] == "User Prompt"
+    assert export_tsv.HEADERS[1] == "提交人"
+    assert export_tsv.HEADERS[17] == "有效性"
+    assert export_tsv.HEADERS[20:22] == ["内部质检", "质检反馈"]
     assert export_tsv.HEADERS[-1] == "备注"
+
+
+def test_checklist_voided_pair_skips_gsb_and_run_blockers(tmp_path):
+    """作废-工程故障: a failed side without a GSB judgement still exports (audit record)."""
+    store = DeskStore(tmp_path / "desk")
+    job = store.create_job({"prompt": "p", "stack": "Go"})
+    store.update_side(job["id"], "A", {"status": "failed", "error": "claude crashed 中断"})
+    store.update_side(job["id"], "B", {"status": "failed", "error": "claude crashed 中断"})
+    job = store.update_review(job["id"], {
+        "validity": "作废-工程故障", "reviewer": "徐子扬",
+    })
+    report = cl.run_checklist(job)
+    blocking_ids = {x["id"] for x in report["items"] if x["blocking"] and not x["ok"]}
+    assert "conclusion" not in blocking_ids
+    assert "reason" not in blocking_ids
+    assert "A_run" not in blocking_ids and "B_run" not in blocking_ids
+    # validity itself must be selected, and an unselected one still blocks
+    assert "validity" not in blocking_ids
+    job2 = store.create_job({"prompt": "p2", "stack": "Go"})
+    assert any(x["id"] == "validity" and x["blocking"] and not x["ok"]
+               for x in cl.run_checklist(job2)["items"])
 
 
 def test_oss_sigv4_request_and_public_url():

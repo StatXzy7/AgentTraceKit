@@ -11,10 +11,40 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
+import time
 from pathlib import Path
 
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
+
+
+def robust_rmtree(path: str | Path, *, retries: int = 3) -> None:
+    """Delete a directory tree on Windows, surviving read-only files and AV locks.
+
+    Git pack files under .git/objects are marked read-only, which makes plain
+    shutil.rmtree fail with WinError 5; antivirus scans right after a child
+    process is killed can also hold transient locks, hence the short retry loop.
+    """
+
+    def _on_exc(func, p, _exc_info):
+        try:
+            os.chmod(p, stat.S_IWRITE | stat.S_IREAD)
+            func(p)
+        except OSError:
+            pass
+
+    target = Path(path)
+    for attempt in range(retries):
+        try:
+            shutil.rmtree(target, onexc=_on_exc)
+            return
+        except FileNotFoundError:
+            return
+        except PermissionError:
+            if attempt == retries - 1:
+                raise
+            time.sleep(0.5 * (attempt + 1))
 
 # Vendor-required 1M context triplet. Injected into each side workspace's
 # local settings so annotation runs are pinned to 1M without touching the
@@ -135,12 +165,19 @@ def sha_pushed(workspace: str | Path, sha: str, branch: str) -> bool:
     return out == sha or is_ancestor(workspace, sha, out)
 
 
-def ensure_remote_contains(workspace: str | Path, sha: str, branch: str) -> None:
-    """Push branch until the remote contains the exact SHA (fast-forward only)."""
-    if sha_pushed(workspace, sha, branch):
+def ensure_remote_contains(workspace: str | Path, sha: str, branch: str, *, force: bool = False) -> None:
+    """Push branch until the remote contains the exact SHA (fast-forward by default).
+
+    ``force`` is used for a side retry: the workspace was freshly re-copied from
+    the baseline, so its history diverged from the previous product on the
+    branch; the branch is tool-owned for this job/side and safe to overwrite.
+    """
+    if not force and sha_pushed(workspace, sha, branch):
         return
     ref = f"HEAD:refs/heads/{branch}"
-    if _remote_branch_exists(workspace, branch):
+    if force:
+        git(["push", "--force", "origin", ref], workspace, timeout=300)
+    elif _remote_branch_exists(workspace, branch):
         git(["push", "origin", ref], workspace, timeout=300)
     else:
         git(["push", "-u", "origin", ref], workspace, timeout=300)
@@ -217,12 +254,12 @@ def prepare_side_workspace(
     return {"workspace": str(dst), "branch": branch, "head": head_sha(dst)}
 
 
-def finalize_side(workspace: str | Path, branch: str, message: str) -> dict[str, str]:
+def finalize_side(workspace: str | Path, branch: str, message: str, *, force: bool = False) -> dict[str, str]:
     """Auto commit all model changes and push; return 40-char sha + permalink."""
     sha = commit_all(workspace, message)
     if not is_sha40(sha):
         raise GitError("产物提交后无法读取 40 位 SHA")
-    ensure_remote_contains(workspace, sha, branch)
+    ensure_remote_contains(workspace, sha, branch, force=force)
     return {"sha": sha, "branch": branch, "url": commit_permalink(workspace, sha)}
 
 
@@ -235,6 +272,59 @@ def _encode_cwd(path: str | Path) -> str:
     """
     resolved = str(Path(path).resolve())
     return re.sub(r"[^A-Za-z0-9]", "-", resolved)
+
+
+def session_has_assistant(path: str | Path) -> bool:
+    """True when the transcript contains a real assistant message.
+
+    A stream-stalled run still leaves a jsonl holding queue/ai-title records but
+    no assistant turn; such a transcript must not count as a completed attempt.
+    """
+    try:
+        with Path(path).open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("type") == "assistant":
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def session_turn_complete(path: str | Path) -> bool:
+    """True when the transcript's last tool call was followed by an assistant turn.
+
+    A stream-killed run ends right after a ``tool_result`` user record with no
+    subsequent assistant message — the agentic turn was interrupted and the
+    product cannot count as a completed single-turn session.
+    """
+    saw_tool_result = False
+    assistant_after_last_result = False
+    try:
+        with Path(path).open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("type") != "user":
+                    if rec.get("type") == "assistant" and saw_tool_result:
+                        assistant_after_last_result = True
+                    continue
+                content = rec.get("message", {}).get("content")
+                is_result = (
+                    isinstance(content, list)
+                    and any(isinstance(c, dict) and c.get("type") == "tool_result" for c in content)
+                )
+                if is_result:
+                    saw_tool_result = True
+                    assistant_after_last_result = False
+    except OSError:
+        return False
+    return not saw_tool_result or assistant_after_last_result
 
 
 def find_session_jsonl(workspace: str | Path) -> list[dict[str, str]]:

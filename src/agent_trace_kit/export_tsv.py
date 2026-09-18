@@ -10,11 +10,12 @@ from .checklist import run_checklist
 from .desk_store import DeskStore
 
 HEADERS = [
-    "User Prompt", "任务类型", "任务难度", "语言/框架", "Harness", "Harness 版本",
+    "User Prompt", "提交人", "任务类型", "Harness", "任务难度", "语言/框架",
     "操作系统", "环境可复现等级", "初始环境快照",
     "A-SessionID", "A-轨迹文件", "A-产物快照", "A-运行录屏",
     "B-SessionID", "B-轨迹文件", "B-产物快照", "B-运行录屏",
-    "GSB 结论", "GSB 理由", "备注",
+    "有效性", "GSB 结论", "GSB 理由",
+    "内部质检", "质检反馈", "备注",
 ]
 
 
@@ -37,20 +38,24 @@ def _note(job: dict) -> str:
 
 def job_row(job: dict) -> list[str]:
     a, b = job["sides"]["A"], job["sides"]["B"]
+    review = job.get("review", {})
     return [
         job.get("prompt", ""),
+        review.get("reviewer", ""),
         job.get("task_type", ""),
+        job.get("harness", ""),
         job.get("difficulty", ""),
         job.get("stack", ""),
-        job.get("harness", ""),
-        job.get("harness_version", ""),
         job.get("os_name", ""),
         job.get("repro_level", ""),
         job.get("baseline_url", ""),
         a.get("session_id", ""), a.get("trace_url", ""), a.get("head_url", ""), a.get("video_url", ""),
         b.get("session_id", ""), b.get("trace_url", ""), b.get("head_url", ""), b.get("video_url", ""),
-        job.get("review", {}).get("conclusion", ""),
-        job.get("review", {}).get("reason", ""),
+        review.get("validity", ""),
+        review.get("conclusion", ""),
+        review.get("reason", ""),
+        # QC-side columns: left blank for the reviewer team to fill in.
+        "", "",
         _note(job),
     ]
 

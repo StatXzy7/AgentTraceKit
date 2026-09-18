@@ -22,27 +22,51 @@ _LOCK = threading.RLock()
 TASK_TYPES = ["0-1代码生成", "Feature迭代", "Bug修复", "代码理解", "代码重构", "工程化", "代码测试"]
 DIFFICULTIES = ["困难", "地狱"]
 CONCLUSIONS = ["A 更好", "Same", "B 更好"]
+# Annotator-filled validity of the pair. A voided pair is kept on record but
+# excluded from evaluation; the reason states whether engineering/environment caused it.
+VALIDITY = ["有效", "作废-工程故障", "作废-环境未重置", "作废-其他"]
+# How easily the initial environment can be reproduced by the evaluation side.
+REPRO_LEVELS = ["无外部依赖", "有外部依赖，未容器化", "已容器化，可一键起环境"]
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "claude_command": "claude",
     "max_parallel_pairs": 2,
     "side_timeout_seconds": 1800,
+    # Gateway SSE streams for deep-thinking coding turns stall silently fairly
+    # often; the watchdog kills a tree with zero CPU/IO/transcript activity and
+    # the side is relaunched in-place until it completes.
+    "stall_seconds": 240,
+    "side_max_attempts": 6,
+    "activity_poll_seconds": 15,
     "oss_endpoint": "https://s3.cn-north-1.jdcloud-oss.com",
     "oss_region": "cn-north-1",
     "oss_bucket": "",
     "oss_public_base": "",
     "oss_key_prefix": "pairwise",
     "workspace_copy_excludes": "",
+    "default_baseline_repo": r"D:\myprojects\GoletaLab数据标注\github-base\logistic-irls",
     "default_task_type": "0-1代码生成",
     "default_difficulty": "困难",
     "default_repro_level": "无外部依赖",
-    "reviewer": "",
+    "reviewer": "徐子扬",
     "env_overrides": {},
 }
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def clean_path(value: Any) -> str:
+    """Normalise a pasted filesystem path: whitespace and wrapping quotes.
+
+    Pasting from terminals/markdown often yields ``"D:\\dir"``, which Path would
+    otherwise treat as a relative path and resolve against the server's cwd.
+    """
+    s = str(value or "").strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        s = s[1:-1].strip()
+    return s
 
 
 class DeskStore:
@@ -67,6 +91,9 @@ class DeskStore:
     def save_settings(self, patch: dict[str, Any]) -> dict[str, Any]:
         with _LOCK:
             current = self.settings()
+            patch = dict(patch)
+            if "default_baseline_repo" in patch:
+                patch["default_baseline_repo"] = clean_path(patch["default_baseline_repo"])
             current.update({k: v for k, v in patch.items() if k in DEFAULT_SETTINGS or k in current})
             self._atomic_write_json(self.settings_path, current)
             return current
@@ -97,7 +124,7 @@ class DeskStore:
                 "env_desc": data.get("env_desc", ""),
                 "check_commands": data.get("check_commands", ""),
                 "copy_excludes": data.get("copy_excludes", ""),
-                "baseline_repo": data.get("baseline_repo", ""),
+                "baseline_repo": clean_path(data.get("baseline_repo", "")),
                 "baseline_sha": "",
                 "baseline_url": "",
                 "harness": "Claude Code",
@@ -107,7 +134,10 @@ class DeskStore:
                 "created_at": now,
                 "updated_at": now,
                 "sides": {"A": side("A"), "B": side("B")},
-                "review": {"conclusion": "", "reason": "", "reviewer": "", "note": ""},
+                "review": {
+                    "validity": "", "conclusion": "", "reason": "",
+                    "reviewer": settings.get("reviewer", ""), "note": "",
+                },
                 "uploads": {"A": {}, "B": {}},
                 "exported": False,
             }
@@ -128,6 +158,13 @@ class DeskStore:
                     continue
             jobs.sort(key=lambda j: j.get("created_at", ""), reverse=True)
             return jobs
+
+    def delete_job(self, job_id: str) -> None:
+        """Remove the job record (workspaces/evidence are removed by the caller)."""
+        with _LOCK:
+            path = self.job_path(job_id)
+            if path.exists():
+                path.unlink()
 
     def update_job(self, job_id: str, patch: dict[str, Any]) -> dict[str, Any]:
         with _LOCK:
@@ -153,7 +190,7 @@ class DeskStore:
         with _LOCK:
             job = self.get_job(job_id)
             review = job["review"]
-            for key in ("conclusion", "reason", "reviewer", "note"):
+            for key in ("validity", "conclusion", "reason", "reviewer", "note"):
                 if key in patch:
                     review[key] = patch[key]
             job["updated_at"] = utc_now()
