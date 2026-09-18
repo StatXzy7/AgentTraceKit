@@ -68,6 +68,28 @@ def _jsonl_user_texts(path: Path) -> list[str]:
     return texts
 
 
+def _normalize_model(name: str) -> str:
+    """auto_model/urm[1M] and auto_model/urm are the same base model."""
+    return re.sub(r"\[[^\]]*\]", "", (name or "").strip())
+
+
+def _jsonl_models(path: Path) -> list[str]:
+    models: set[str] = set()
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                msg = rec.get("message")
+                if isinstance(msg, dict) and msg.get("model"):
+                    models.add(str(msg["model"]))
+    except OSError:
+        pass
+    return sorted(models)
+
+
 def _side_checks(items: list, job: dict, side_name: str, online: bool) -> None:
     side = job["sides"][side_name]
     group = f"{side_name} 侧"
@@ -90,6 +112,13 @@ def _side_checks(items: list, job: dict, side_name: str, online: bool) -> None:
                "已在轨迹用户消息中找到该 prompt" if hit else "轨迹里找不到本题 prompt，可能绑错了会话")
         _check(items, f"{side_name}_single_turn", group, "只有一轮有效交互（规范要求首轮）",
                len(user_texts) == 1, f"识别到 {len(user_texts)} 条用户消息", blocking=False)
+        used_models = _jsonl_models(Path(jsonl))
+        pinned = _normalize_model(ws.PINNED_MODEL)
+        mismatched = [m for m in used_models if _normalize_model(m) != pinned]
+        _check(items, f"{side_name}_model", group, f"使用指定模型（{ws.PINNED_MODEL}）",
+               bool(used_models) and not mismatched,
+               "轨迹记录模型：" + ", ".join(used_models) if used_models else "轨迹里读不到模型名",
+               blocking=False)
 
     sha = side.get("head_sha", "")
     sha_ok = ws.is_sha40(sha)

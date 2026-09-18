@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -14,6 +15,57 @@ import subprocess
 from pathlib import Path
 
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
+
+# Vendor-required 1M context triplet. Injected into each side workspace's
+# local settings so annotation runs are pinned to 1M without touching the
+# user's global or cc-switch configuration. Model tiers are intentionally NOT
+# overridden here: the gateway accepts the [1M] suffix on the main/opus/sonnet
+# tiers but rejects it on the haiku tier (used for background title calls), so
+# the proven global tier mapping is inherited as-is.
+PINNED_MODEL = "auto_model/urm[1M]"
+CONTEXT_ENV_1M = {
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000000",
+    "DISABLE_COMPACT": "1",
+    "ANTHROPIC_BETAS": "context-1m-2025-08-07",
+}
+CONTEXT_SETTINGS_RELPATH = ".claude/settings.local.json"
+
+
+def write_context_settings(workspace: str | Path) -> Path:
+    """Merge the 1M/model-pin env into the workspace's local settings file."""
+    ws_dir = Path(workspace)
+    settings_path = ws_dir / CONTEXT_SETTINGS_RELPATH
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    data = {}
+    if settings_path.exists():
+        try:
+            data = json.loads(settings_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            data = {}
+    env = dict(data.get("env") or {})
+    # Remove model-pin keys from earlier versions (the gateway rejects [1M] on
+    # the haiku tier); proven global tier mapping is inherited instead.
+    for legacy_key in (
+        "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL",
+    ):
+        env.pop(legacy_key, None)
+    env.update(CONTEXT_ENV_1M)
+    data["env"] = env
+    settings_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return settings_path
+
+
+def _exclude_local_settings(workspace: str | Path) -> None:
+    """Make sure .claude/settings.local.json is never committed (local exclude)."""
+    exclude = Path(workspace) / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    lines = exclude.read_text(encoding="utf-8", errors="replace").splitlines() if exclude.exists() else []
+    entries = {ln.strip() for ln in lines if ln.strip() and not ln.strip().startswith("#")}
+    for rule in (".claude/settings.local.json",):
+        if rule not in entries:
+            lines.append(rule)
+    exclude.write_text("\n".join(lines) + "\n", encoding="utf-8")
 DEFAULT_COPY_EXCLUDES = {
     ".git",  # re-initialised per side so workspaces share no object store state
 }
@@ -160,6 +212,8 @@ def prepare_side_workspace(
 
     shutil.copytree(src, dst, ignore=ignore)
     git(["checkout", "-B", branch], dst)
+    write_context_settings(dst)
+    _exclude_local_settings(dst)
     return {"workspace": str(dst), "branch": branch, "head": head_sha(dst)}
 
 

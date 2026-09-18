@@ -44,14 +44,20 @@ python -m agent_trace_kit.desk          # 或 atk desk
    快照基线并 push → 复制出两个隔离工作区 → 建 `pair-<id>-a/-b` 两个分支 → 入队运行。
 3. **批量出题**：「📋 批量导入提示词」，每行一条。纯文本=每行一个 prompt；
    TSV 行可带 `提示词⇥题型⇥难度⇥语言框架⇥基线仓库目录`（第 5 列可逐行指定不同题目仓库）。
-4. **自动跑 A/B**：工作区各自执行
+4. **自动跑 A/B**：准备时每个工作区会写入本地 `.claude/settings.local.json`，包含供应商要求的
+   1M 三件套（`CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000`、`DISABLE_COMPACT=1`、
+   `ANTHROPIC_BETAS=context-1m-2025-08-07`），该文件通过 `.git/info/exclude` 保证**永不被提交**。
+   网关地址、token、各档模型映射继续沿用你全局/cc-switch 已验证可用的配置（seed-code.bytedance.com，
+   auto_model/urm[1M] 主模型），不写进任务仓库。随后工作区各自执行
    `claude -p --permission-mode acceptEdits --verbose "<同一 prompt>"`，只一轮；
    跑完自动 `git add -A` + commit + push 两侧分支，记录 40 位 SHA 和 permalink，
    按工作区 cwd 从 `~/.claude/projects` 精确匹配出本次会话 jsonl 并留存证据副本。
+   - 起标题子请求偶发 `unrecognized_model auto_model/urm` 警告是该网关已知特性，主回复不受影响。
    - 页面每 5 秒自动刷新运行状态；单侧可「中止」「重跑」（重跑会从基线重新复制该侧，不污染另一侧）。
-5. **录屏（仅有的两件人工事之一）**：分别进 A、B 工作区，从干净状态启动并展示产物真实运行，
-   每段 ≤90 秒，失败也要录。页面上「选择…」用原生对话框选 mp4（工具用 ffprobe 自动查时长，
-   超 90 秒亮红灯）。
+5. **录屏（仅有的两件人工事之一）**：分别为 A、B 侧点「● 开始录屏」（内置 ffmpeg 录主屏幕，
+   无需第三方软件），切到产物窗口从干净状态展示真实运行，点「■ 停止并保存」；
+   **90 秒自动停止**，失败的产物也要录。工具用 ffprobe 自动查时长，超 90 秒亮红灯。
+   也可以用「选择已有文件…」绑定你用别的软件录好的 mp4。
 6. **③ 上传到 OSS**：jsonl 与 mp4 传到 `pairwise/<sessionid>.jsonl|.mp4`，
    回填公开链接，并可在线核验匿名可访问。幂等，可重复点。
 7. **检查清单**：题目/环境/初始快照/A/B/一致性/GSB/安全分组逐项亮灯。阻塞项全绿才能导出。

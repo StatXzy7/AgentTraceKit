@@ -16,6 +16,7 @@ from . import workspace as ws
 from .checklist import run_checklist
 from .desk_store import CONCLUSIONS, DIFFICULTIES, TASK_TYPES, DeskStore
 from .export_tsv import HEADERS, export_tsv, job_row, upload_side
+from .recorder import Recorder
 from .runner import PairRunner
 
 PAGE = r"""<!doctype html>
@@ -221,12 +222,27 @@ function renderDetail(id){SEL=id;const j=JOBS.find(x=>x.id===id);if(!j)return;
       <button class="ghost" onclick="refreshDetail()">↻ 刷新检查</button>
       <button class="ghost" onclick="act('collect')">重新采集会话</button>
     </div>
-    <div style="margin-top:8px"><label>A 侧录屏文件（mp4，本地路径，也可点右侧选择）</label>
-      <div style="display:flex;gap:8px"><input id="vA" value="${esc(j.sides.A.video_local||"")}" placeholder="D:\videos\a.mp4">
-      <button class="ghost" type="button" onclick="pickVideo('A')">选择…</button></div></div>
-    <div style="margin-top:8px"><label>B 侧录屏文件</label>
-      <div style="display:flex;gap:8px"><input id="vB" value="${esc(j.sides.B.video_local||"")}" placeholder="D:\videos\b.mp4">
-      <button class="ghost" type="button" onclick="pickVideo('B')">选择…</button></div></div>
+    <div class="grid" style="margin-top:8px">
+      <div class="sidebox"><h3>🎥 A 侧录屏</h3>
+        <div id="recA" class="kv muted">未开始</div>
+        <div class="btns" style="margin-top:6px">
+          <button onclick="recStart('A')">● 开始录屏</button>
+          <button class="sec" id="recStopA" onclick="recStop('A')" disabled>■ 停止并保存</button>
+          <button class="ghost" type="button" onclick="pickVideo('A')">选择已有文件…</button>
+        </div>
+        <input id="vA" value="${esc(j.sides.A.video_local||"")}" style="margin-top:6px" placeholder="也可直接粘贴 mp4 路径">
+      </div>
+      <div class="sidebox"><h3>🎥 B 侧录屏</h3>
+        <div id="recB" class="kv muted">未开始</div>
+        <div class="btns" style="margin-top:6px">
+          <button onclick="recStart('B')">● 开始录屏</button>
+          <button class="sec" id="recStopB" onclick="recStop('B')" disabled>■ 停止并保存</button>
+          <button class="ghost" type="button" onclick="pickVideo('B')">选择已有文件…</button>
+        </div>
+        <input id="vB" value="${esc(j.sides.B.video_local||"")}" style="margin-top:6px" placeholder="也可直接粘贴 mp4 路径">
+      </div>
+    </div>
+    <p class="kv muted" style="margin:6px 2px">录主屏幕（含声音以外的全部画面），<b>90 秒自动停止</b>；录的是产物真实运行，失败也要录。录完点「保存录屏路径」再上传 OSS。</p>
     <div class="btns">
       <button class="sec" onclick="act('set_videos')">保存录屏路径</button>
       <button onclick="act('upload')">③ 上传轨迹+录屏到 OSS</button>
@@ -253,6 +269,7 @@ function renderDetail(id){SEL=id;const j=JOBS.find(x=>x.id===id);if(!j)return;
       <button class="ghost" onclick="downloadTsv()">下载 .tsv 文件</button></div>
     </div>
   </div>`;
+  recRefresh("A");recRefresh("B");
   D.scrollIntoView({behavior:"smooth"});
 }
 function sideHtml(j,s){const x=j.sides[s];const run=x.status==="running";
@@ -282,6 +299,25 @@ function downloadTsv(){const b=new Blob([window.__tsv||""],{type:"text/tab-separ
 async function openLog(s){const x=await api("/api/log",{job:SEL,side:s});const w=window.open("","_blank");w.document.write(`<pre style="font:12px Consolas;white-space:pre-wrap">${esc(x.log||"(空)")}</pre>`)}
 async function pickVideo(s){const x=await api("/api/pick_file",{side:s});if(x.path){$("v"+s).value=x.path}}
 
+let recTimers={};
+async function recStart(s){await api("/api/rec_start",{job:SEL,side:s});toast(s+" 侧开始录屏——切到产物窗口，从干净状态展示真实运行");recRefresh(s)}
+async function recStop(s){await api("/api/rec_stop",{job:SEL,side:s});recRefresh(s);await refreshDetail();toast(s+" 侧录屏已保存")}
+async function recRefresh(s){
+  clearInterval(recTimers[s]);
+  let x;try{const r=await fetch("/api/rec_status",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({job:SEL,side:s})});x=await r.json()}catch(e){return}
+  const el=$("rec"+s);if(!el)return;
+  if(x.recording){
+    const btn=$("recStop"+s);if(btn)btn.disabled=false;
+    el.innerHTML=`🔴 录制中 <b>${x.elapsed}s</b> / ${x.max}s（到点自动停止并保存）`;
+    el.className="kv bad";
+    recTimers[s]=setInterval(()=>recRefresh(s),1000);
+  }else{
+    const btn=$("recStop"+s);if(btn)btn.disabled=true;
+    if(x.path){el.innerHTML=`✓ 已保存 ${x.duration?x.duration.toFixed(0)+"s":""} ${x.size?(x.size/1024/1024).toFixed(1)+"MB":""}<br><span class="muted">${esc(x.path)}</span>`;el.className="kv ok"}
+    else{el.textContent="未开始";el.className="kv muted"}
+  }
+}
+
 loadSettings().then(loadJobs);
 pollTimer=setInterval(()=>{if(JOBS.some(j=>["running","ready"].includes(j.status)||Object.values(j.sides).some(x=>["running","preparing"].includes(x.status))))loadJobs()},5000);
 </script></body></html>"""
@@ -291,6 +327,7 @@ class DeskServer:
     def __init__(self, store: DeskStore, port: int = 8765):
         self.store = store
         self.runner = PairRunner(store)
+        self.recorder = Recorder(store)
         self.port = port
 
     def oss_cfg(self, overrides: dict | None = None) -> oss_mod.OssConfig | None:
@@ -503,6 +540,12 @@ class DeskServer:
                     return {"log": p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""}
                 if path == "/api/pick_file":
                     return server._pick_file(body.get("side", "A"))
+                if path == "/api/rec_start":
+                    return server.recorder.start(body["job"], body["side"])
+                if path == "/api/rec_stop":
+                    return server.recorder.stop(body["job"], body["side"])
+                if path == "/api/rec_status":
+                    return server.recorder.status(body["job"], body["side"])
                 return {"ok": False, "error": f"unknown path {path}"}
 
         return Handler
@@ -535,6 +578,7 @@ class DeskServer:
             pass
         finally:
             self.runner.stop()
+            self.recorder.stop_all()
             httpd.server_close()
 
 
