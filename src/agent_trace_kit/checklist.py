@@ -71,8 +71,15 @@ def _jsonl_user_texts(path: Path) -> list[str]:
 
 
 def _normalize_model(name: str) -> str:
-    """auto_model/urm[1M] and auto_model/urm are the same base model."""
-    return re.sub(r"\[[^\]]*\]", "", (name or "").strip())
+    """auto_model/urm[1M] and auto_model/urm are the same base model.
+
+    Stream transcripts also tag auxiliary/title turns as ``<synthetic>`` or
+    ``<synthetic-name>``; strip the wrapper so those records don't read as a
+    different model.
+    """
+    s = re.sub(r"\[[^\]]*\]", "", (name or "").strip())
+    s = s.replace("<synthetic>", "").replace("</synthetic>", "")
+    return re.sub(r"^<[^>]*>|</[^>]*>$", "", s).strip()
 
 
 def _jsonl_models(path: Path) -> list[str]:
@@ -95,6 +102,9 @@ def _jsonl_models(path: Path) -> list[str]:
 def _side_checks(items: list, job: dict, side_name: str, online: bool) -> None:
     side = job["sides"][side_name]
     group = f"{side_name} 侧"
+    # Engineering-failure pairs are kept for audit, so a truncated/failed run
+    # only blocks export for pairs still marked valid.
+    voided = job.get("review", {}).get("validity", "") not in ("", "有效")
     wdir = side.get("workspace", "")
     _check(items, f"{side_name}_workspace", group, "独立工作区", bool(wdir) and Path(wdir).is_dir(),
            wdir or "未准备工作区")
@@ -121,6 +131,21 @@ def _side_checks(items: list, job: dict, side_name: str, online: bool) -> None:
                bool(used_models) and not mismatched,
                "轨迹记录模型：" + ", ".join(used_models) if used_models else "轨迹里读不到模型名",
                blocking=False)
+
+        # Gateway cuts mid-turn leave a detectable tail: a synthetic "API Error"
+        # final message (e.g. seed-code 504) or a transcript ending right after a
+        # tool_result. Such evidence must never be exported as a valid product.
+        reason = ws.transcript_interruption_reason(Path(jsonl))
+        reason_labels = {
+            "api_error": "轨迹末尾是网关报错（API Error，如 504 断流），本轮被中途截断",
+            "dangling_tool_result": "轨迹停在工具返回后、没有模型收尾，本轮被中途截断",
+            "no_assistant": "轨迹里没有任何模型回复，本轮未真正执行",
+            "unreadable": "轨迹文件无法读取",
+        }
+        _check(items, f"{side_name}_trace_complete", group, "轨迹完整（首轮未被网关截断）",
+               reason is None,
+               reason_labels.get(reason, "首轮完整，最后一次工具调用后有模型收尾"),
+               blocking=not voided)
 
     sha = side.get("head_sha", "")
     sha_ok = ws.is_sha40(sha)
@@ -174,7 +199,6 @@ def _side_checks(items: list, job: dict, side_name: str, online: bool) -> None:
     if side.get("status") == "failed":
         # A pair declared void (e.g. engineering failure) is still exported for
         # audit with whatever evidence exists, so a failed run does not block it.
-        voided = job.get("review", {}).get("validity", "") not in ("", "有效")
         _check(items, f"{side_name}_run", group, "本次执行成功结束", False,
                side.get("error", "执行失败") + "（失败也必须保留证据；可重跑该侧）",
                blocking=not voided)

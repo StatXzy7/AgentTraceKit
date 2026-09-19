@@ -10,8 +10,10 @@ import pytest
 
 from agent_trace_kit import checklist as cl
 from agent_trace_kit import export_tsv
+from agent_trace_kit import ghutil
 from agent_trace_kit import oss as oss_mod
 from agent_trace_kit import workspace as ws
+from agent_trace_kit.desk import DeskServer
 from agent_trace_kit.desk_store import DeskStore
 from agent_trace_kit.runner import PairRunner
 
@@ -118,6 +120,236 @@ def test_clean_path_strips_wrapping_quotes():
     assert clean_path(r"'D:\myprojects\repo'") == r"D:\myprojects\repo"
     assert clean_path("  D:\\x  ") == "D:\\x"
     assert clean_path("") == ""
+
+
+def _write_transcript(path: Path, records: list[dict]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in records),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _tool_tail_records(prompt: str, final_text: str | None, *, final_is_api_error: bool = False):
+    """user prompt -> assistant tool_use -> tool_result -> optional final assistant."""
+    recs = [
+        {"type": "user", "message": {"role": "user", "content": [
+            {"type": "text", "text": prompt}]}},
+        {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t1", "name": "Write", "input": {}}]}},
+        {"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}},
+    ]
+    if final_text is not None:
+        if final_is_api_error:
+            recs.append({"type": "assistant", "isApiErrorMessage": True, "apiErrorStatus": 504,
+                         "message": {"role": "assistant", "model": "<synthetic>",
+                                     "content": [{"type": "text", "text": final_text}]}})
+        else:
+            recs.append({"type": "assistant", "message": {"role": "assistant",
+                                                           "content": [{"type": "text", "text": final_text}]}})
+    return recs
+
+
+def _api_error_record(text: str = "API Error: 504 Gateway Time-out") -> dict:
+    return {"type": "assistant", "isApiErrorMessage": True, "apiErrorStatus": 504,
+            "message": {"role": "assistant", "model": "<synthetic>",
+                        "content": [{"type": "text", "text": text}]}}
+
+
+def test_transcript_interruption_classification(tmp_path):
+    p = tmp_path / "cut-504.jsonl"
+    _write_transcript(p, _tool_tail_records(
+        "build it", "API Error: 504 Gateway Time-out", final_is_api_error=True))
+    assert ws.transcript_interruption_reason(p) == "api_error"
+    assert not ws.session_turn_complete(p)
+    assert ws.session_has_assistant(p)
+
+    p2 = tmp_path / "cut-stall.jsonl"
+    _write_transcript(p2, _tool_tail_records("build it", None))
+    assert ws.transcript_interruption_reason(p2) == "dangling_tool_result"
+    assert not ws.session_turn_complete(p2)
+
+    p3 = tmp_path / "complete.jsonl"
+    _write_transcript(p3, _tool_tail_records("build it", "全部完成，测试已通过"))
+    assert ws.transcript_interruption_reason(p3) is None
+    assert ws.session_turn_complete(p3) and ws.session_has_assistant(p3)
+
+    p4 = tmp_path / "empty.jsonl"
+    _write_transcript(p4, [{"type": "ai-title", "aiTitle": "x"}])
+    assert ws.transcript_interruption_reason(p4) == "no_assistant"
+    assert not ws.session_has_assistant(p4)
+
+    # A real model answer that merely quotes the words "API Error" is NOT a cut.
+    p5 = tmp_path / "quoted-error.jsonl"
+    _write_transcript(p5, _tool_tail_records("document 504s", "API Error 处理说明：收到 504 时应重试。"))
+    assert ws.transcript_interruption_reason(p5) is None
+
+    # Trailing synthetic 504 AFTER a normal closing answer = complete turn
+    # (CLI exits non-zero on a post-turn auxiliary call, but the product is done).
+    recs = _tool_tail_records("build it", "全部完成，测试已通过")
+    recs.append(_api_error_record())
+    p6 = tmp_path / "trailing-504.jsonl"
+    _write_transcript(p6, recs)
+    assert ws.transcript_interruption_reason(p6) is None
+
+
+class _FakeProc:
+    """Minimal subprocess.Popen double: fixed stdout lines, already exited."""
+
+    def __init__(self, lines: list[str], returncode: int):
+        self.stdout = list(lines)
+        self.pid = 424242
+        self.returncode = returncode
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def terminate(self):
+        pass
+
+
+def _run_one_attempt(store, tmp_path, transcript_path: Path,
+                     stream_lines: list[str], returncode: int, monkeypatch):
+    from agent_trace_kit import runner as rn
+    if not store.list_jobs():
+        store.create_job({"prompt": "实现一个模块"})
+    job_id = store.list_jobs()[0]["id"]
+    wdir = tmp_path / "w"
+    wdir.mkdir(exist_ok=True)
+    fake_proc = _FakeProc(stream_lines, returncode)
+    monkeypatch.setattr(rn.subprocess, "Popen", lambda *a, **k: fake_proc)
+    monkeypatch.setattr(ws, "find_session_jsonl",
+                        lambda w: [{"path": str(transcript_path), "session_id": "sid-x",
+                                    "mtime": "9999999999"}])
+    monkeypatch.setattr(rn.PairRunner, "_latest_transcript_mtime", staticmethod(lambda w: 0.0))
+    evidence = store.evidence_dir(job_id)
+    return rn.PairRunner(store)._run_attempt(
+        job_id, "A", str(wdir), evidence, evidence / "a-run.log",
+        timeout=60, stall_after=30, poll_every=5, attempt=1,
+    )
+
+
+def _result_line(is_error: bool) -> str:
+    return json.dumps({"type": "result", "subtype": "success", "is_error": is_error,
+                       "num_turns": 3, "total_cost_usd": 0.0,
+                       "result": "API Error: 429 rate limited" if is_error else "完成"}) + "\n"
+
+
+def test_runner_passes_permission_mode(tmp_path, monkeypatch):
+    """Default is bypassPermissions (acceptEdits auto-denies all Bash under -p);
+    a settings override flows through to the CLI argv."""
+    from agent_trace_kit import runner as rn
+    store = DeskStore(tmp_path / "desk")
+    store.create_job({"prompt": "实现一个模块"})
+    job_id = store.list_jobs()[0]["id"]
+    wdir = tmp_path / "w"
+    wdir.mkdir(exist_ok=True)
+    captured = {}
+
+    class CapturingPopen(_FakeProc):
+        def __init__(self, args, **kw):
+            captured["args"] = args
+            super().__init__([_result_line(False)], 0)
+
+    def fake_popen(args, **kw):
+        return CapturingPopen(args, **kw)
+
+    complete = _write_transcript(
+        tmp_path / "complete.jsonl", _tool_tail_records("实现一个模块", "完成"))
+    monkeypatch.setattr(rn.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(ws, "find_session_jsonl",
+                        lambda w: [{"path": str(complete), "session_id": "sid-x", "mtime": "9"}])
+    monkeypatch.setattr(rn.PairRunner, "_latest_transcript_mtime", staticmethod(lambda w: 0.0))
+    evidence = store.evidence_dir(job_id)
+    rn.PairRunner(store)._run_attempt(
+        job_id, "A", str(wdir), evidence, evidence / "a-run.log",
+        timeout=60, stall_after=30, poll_every=5, attempt=1)
+    assert captured["args"][captured["args"].index("--permission-mode") + 1] == "bypassPermissions"
+
+    store.save_settings({"permission_mode": "plan"})
+    rn.PairRunner(store)._run_attempt(
+        job_id, "A", str(wdir), evidence, evidence / "a-run.log",
+        timeout=60, stall_after=30, poll_every=5, attempt=1)
+    assert captured["args"][captured["args"].index("--permission-mode") + 1] == "plan"
+
+
+def test_runner_accepts_exit1_trailing504_after_clean_turn(tmp_path, monkeypatch):
+    """exit 1 + 504 stream line + clean result + complete transcript = success."""
+    store = DeskStore(tmp_path / "desk")
+    complete = _write_transcript(
+        tmp_path / "complete.jsonl", _tool_tail_records("实现一个模块", "完成，测试通过"))
+    out = _run_one_attempt(store, tmp_path, complete,
+                           ["API Error: 504 trailing auxiliary failure\n", _result_line(False)], 1,
+                           monkeypatch)
+    assert out["completed"] is True and out["code"] == 1
+
+
+def test_runner_rejects_result_is_error(tmp_path, monkeypatch):
+    store = DeskStore(tmp_path / "desk")
+    complete = _write_transcript(
+        tmp_path / "complete.jsonl", _tool_tail_records("实现一个模块", "完成"))
+    out = _run_one_attempt(store, tmp_path, complete, [_result_line(True)], 1, monkeypatch)
+    assert out["completed"] is False
+    assert "result 错误" in out["failure"]
+
+
+def test_runner_rejects_midturn_cut_even_if_stream_says_success(tmp_path, monkeypatch):
+    """f02ec37c: stream says success but transcript tail is a terminal 504."""
+    store = DeskStore(tmp_path / "desk")
+    cut = _write_transcript(
+        tmp_path / "cut.jsonl",
+        _tool_tail_records("实现一个模块", "API Error: 504 Gateway Time-out",
+                           final_is_api_error=True))
+    out = _run_one_attempt(store, tmp_path, cut, [_result_line(False)], 0, monkeypatch)
+    assert out["completed"] is False
+    assert "截断" in out["failure"]
+
+
+def test_retry_backoff_grows_and_caps():
+    import random as _random
+    from agent_trace_kit.runner import retry_backoff_seconds
+    rng = _random.Random(0)
+    waits = [retry_backoff_seconds(a, rng) for a in range(2, 8)]
+    assert waits[0] > 0
+    assert waits[0] < waits[1] < waits[2]
+    assert all(w <= 120 for w in waits)
+    assert waits[-1] <= 120
+
+
+def test_checklist_blocks_cut_transcript(tmp_path, baseline_repo, monkeypatch):
+    """A done side whose transcript tail is a gateway 504 must block export."""
+    store = DeskStore(tmp_path / "desk")
+    job = store.create_job({"prompt": "实现一个模块", "stack": "Python",
+                            "baseline_repo": str(baseline_repo)})
+    ws.snapshot_baseline(baseline_repo)
+    info = ws.prepare_side_workspace(baseline_repo, tmp_path / "ws" / "a", "pair-x-a")
+    fin = ws.finalize_side(info["workspace"], "pair-x-a", "A product")
+    cut_jsonl = _write_transcript(
+        tmp_path / "ev" / "a-cut.jsonl",
+        _tool_tail_records(job["prompt"], "API Error: 504 Gateway Time-out",
+                           final_is_api_error=True))
+    store.update_side(job["id"], "A", {
+        "workspace": info["workspace"], "session_id": "sid-cut",
+        "jsonl_local": str(cut_jsonl), "head_sha": fin["sha"],
+        "head_url": f"https://github.com/org/repo/commit/{fin['sha']}",
+        "pushed": True, "status": "done",
+        "trace_url": "https://oss.example.com/sid-cut.jsonl",
+    })
+    job = store.get_job(job["id"])
+    blocked = {x["id"]: x for x in cl.run_checklist(job)["items"]
+               if x["blocking"] and not x["ok"]}
+    assert "A_trace_complete" in blocked
+    # declaring the pair an engineering fault downgrades it to non-blocking audit
+    store.update_review(job["id"], {"validity": "作废-工程故障"})
+    job = store.get_job(job["id"])
+    a_item = next(x for x in cl.run_checklist(job)["items"] if x["id"] == "A_trace_complete")
+    assert not a_item["ok"] and not a_item["blocking"]
+
 
 
 def test_checklist_blocks_then_passes(tmp_path, baseline_repo, monkeypatch):
@@ -255,3 +487,261 @@ def test_oss_config_from_secrets_file(tmp_path):
     cfg = oss_mod.config_from_mapping(mapping, secrets)
     assert cfg is not None and cfg.access_key_id == "JDC_X" and cfg.bucket == "b1"
     assert oss_mod.config_from_mapping({"oss_bucket": ""}, secrets) is None
+
+
+# ---------- one-click baseline provisioning (ghutil + workspace + runner) ----------
+
+def test_repo_name_validation():
+    from agent_trace_kit import ghutil
+    assert ghutil.validate_repo_name("rate-limiter_lib") == ""
+    assert ghutil.validate_repo_name("a") == ""
+    assert ghutil.validate_repo_name("") != ""
+    assert ghutil.validate_repo_name("bad name") != ""       # space
+    assert ghutil.validate_repo_name("bad/name") != ""
+    assert ghutil.validate_repo_name("con") != ""            # Windows reserved
+    assert ghutil.validate_repo_name("con.txt") != ""        # reserved base + extension
+    assert ghutil.validate_repo_name("nul.md") != ""
+    assert ghutil.validate_repo_name("-leaddash") != ""      # option-injection guard
+    assert ghutil.validate_repo_name("a..b") != ""
+    assert ghutil.validate_repo_name("trailing.") != ""
+    assert ghutil.validate_repo_name("x" * 101) != ""
+
+
+def test_render_readme_default_blurb_contains_title():
+    from agent_trace_kit import ghutil
+    out = ghutil.render_readme("my-task", "")
+    assert out.startswith("# my-task\n") and "基线" in out
+    assert "一句话说明" in ghutil.render_readme("r", "一句话说明")
+
+
+class _FakeGh:
+    """Scripted gh stand-in: records create calls, returns None or a repo on view."""
+
+    def __init__(self, existing: "ghutil.RemoteRepo | None" = None, login: str = "StatXzy7",
+                 url: str = ""):
+        self._existing = existing
+        self._login = login
+        self._url = url
+        self.created: list[tuple[str, str, bool]] = []
+
+    def viewer_login(self) -> str:
+        return self._login
+
+    def repo_view(self, owner: str, name: str):
+        return self._existing
+
+    def repo_create(self, owner: str, name: str, description: str, private: bool):
+        self.created.append((name, description, private))
+        repo = ghutil.RemoteRepo(
+            name=name, owner=owner,
+            url=self._url or f"https://github.com/{owner}/{name}",
+            default_branch="main", visibility="PRIVATE" if private else "PUBLIC",
+        )
+        self._existing = repo
+        return repo
+
+
+def test_ensure_remote_repo_creates_when_missing_and_reuses_when_present():
+    from agent_trace_kit import ghutil
+    fake = _FakeGh(existing=None)
+    repo, created = ghutil.ensure_remote_repo("new-task", "blurb", private=False, gh=fake)
+    assert created is True and repo.full_name == "StatXzy7/new-task"
+    assert repo.visibility == "PUBLIC" and repo.default_branch == "main"
+    assert fake.created == [("new-task", "blurb", False)]
+    # second call finds the repo and never recreates it
+    repo2, created2 = ghutil.ensure_remote_repo("new-task", "blurb", private=True, gh=fake)
+    assert created2 is False and repo2.url == repo.url and len(fake.created) == 1
+
+
+def test_provision_baseline_folder_seeds_empty_remote_and_is_idempotent(tmp_path):
+    import subprocess
+    bare = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", str(bare)], check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    parent = tmp_path / "github-base"
+
+    info = ws.provision_baseline_folder(parent, "task-x", bare.as_uri(), "main", "题目说明")
+    target = Path(info["path"])
+    assert ws.is_sha40(info["sha"]) and info["branch"] == "main" and info["seeded"] is True
+    assert (target / "README.md").read_text(encoding="utf-8").startswith("# task-x\n\n题目说明")
+    assert (target / ".gitignore").exists()
+    # the initial commit is reachable on the bare remote's main
+    assert ws._remote_branch_exists(target, "main")
+
+    # re-running is a no-op: no new seed commit, same sha
+    again = ws.provision_baseline_folder(parent, "task-x", bare.as_uri(), "main", "题目说明")
+    assert again["seeded"] is False and again["sha"] == info["sha"]
+
+
+def test_provision_baseline_folder_clones_existing_remote_without_injecting(tmp_path):
+    """A remote that already has history is cloned as-is (README blurb not injected)."""
+    import subprocess
+    bare = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", str(bare)], check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _git(["init", "-b", "main"], seed)
+    _git(["config", "user.email", "t@example.com"], seed)
+    _git(["config", "user.name", "T"], seed)
+    (seed / "problem.md").write_text("题目本体\n", encoding="utf-8")
+    _git(["add", "-A"], seed)
+    _git(["commit", "-m", "题目初始代码"], seed)
+    _git(["remote", "add", "origin", str(bare)], seed)
+    _git(["push", "-u", "origin", "main"], seed)
+    original_sha = ws.head_sha(seed)
+
+    parent = tmp_path / "github-base"
+    info = ws.provision_baseline_folder(parent, "task-y", bare.as_uri(), "main", "忽略此说明")
+    assert info["seeded"] is False and info["sha"] == original_sha
+    target = Path(info["path"])
+    assert (target / "problem.md").exists()
+    assert not (target / "README.md").exists()  # existing history is never mutated
+
+
+def test_provision_rejects_unrelated_non_git_folder(tmp_path):
+    import subprocess
+    bare = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", str(bare)], check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    parent = tmp_path / "github-base"
+    occupied = parent / "task-z"
+    occupied.mkdir(parents=True)
+    (occupied / "notes.txt").write_text("user file", encoding="utf-8")
+    with pytest.raises(ws.GitError):
+        ws.provision_baseline_folder(parent, "task-z", bare.as_uri(), "main", "")
+
+
+def test_job_carries_provisioning_fields_from_settings(tmp_path):
+    store = DeskStore(tmp_path / "desk")
+    store.save_settings({"baseline_parent_dir": str(tmp_path / "base"),
+                         "github_owner": "", "github_private": True})
+    job = store.create_job({"prompt": "p", "github_repo": "new-repo", "github_readme": "说明"})
+    assert job["github_repo"] == "new-repo"
+    assert job["github_readme"] == "说明"
+    assert job["github_private"] is True
+    assert job["baseline_parent_dir"] == str(tmp_path / "base")
+    assert job["baseline_repo"] == ""
+
+
+def test_path_vs_repo_name_heuristic():
+    f = DeskServer._looks_like_local_path
+    assert f(r"D:\myprojects\GoletaLab数据标注\github-base\x")
+    assert f("/home/u/repos/x")
+    assert not f("rate-limiter-lib")
+    assert not f("my_repo.name-1")
+    assert f("C:/work/x")
+    assert not f("")
+
+
+def test_prepare_end_to_end_provisions_github_repo(tmp_path, monkeypatch):
+    """prepare() on a name-only job: fake gh + local bare remote -> seeded baseline + A/B."""
+    from agent_trace_kit import runner as rn
+    import subprocess
+
+    bare = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", str(bare)], check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    parent = tmp_path / "github-base"
+    store = DeskStore(tmp_path / "desk")
+    store.save_settings({"baseline_parent_dir": str(parent)})
+    job = store.create_job({"prompt": "实现一个模块", "github_repo": "e2e-task",
+                            "github_readme": "端到端题目"})
+
+    fake = _FakeGh(existing=None, url=bare.as_uri())
+    _orig_ensure = ghutil.ensure_remote_repo
+
+    def _fake_ensure(name, desc, *, private, owner="", gh=None):
+        return _orig_ensure(name, desc, private=private, owner=owner, gh=fake)
+
+    monkeypatch.setattr(rn.ghutil, "ensure_remote_repo", _fake_ensure)
+    report = rn.PairRunner(store).prepare(job["id"])
+    assert report["provisioned"] is not None
+    assert report["provisioned"]["created"] is True
+    assert report["provisioned"]["seeded"] is True
+    assert fake.created[0][0] == "e2e-task"
+
+    done = store.get_job(job["id"])
+    assert done["baseline_repo"] == str(parent / "e2e-task")
+    assert ws.is_sha40(done["baseline_sha"]) and done["status"] == "ready"
+    # both isolated side workspaces were copied from the seeded baseline
+    for side_name in ("A", "B"):
+        wdir = done["sides"][side_name]["workspace"]
+        assert Path(wdir).is_dir() and (Path(wdir) / "README.md").exists()
+    # a second prepare reuses the local repo (no new remote create, same baseline sha)
+    rn.PairRunner(store).prepare(job["id"])
+    assert len(fake.created) == 1
+
+
+def test_provision_refuses_zero_commit_folder_with_user_files(tmp_path):
+    """HIGH: a git-init'd folder holding untracked files must never have them
+    swept into a (public by default) initial commit/push."""
+    import subprocess
+    bare = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", str(bare)], check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    parent = tmp_path / "github-base"
+    target = parent / "task-w"
+    target.mkdir(parents=True)
+    _git(["init", "-b", "main"], target)
+    (target / "secret.txt").write_text("TOP SECRET\n", encoding="utf-8")  # untracked
+    with pytest.raises(ws.GitError, match="拒绝自动提交"):
+        ws.provision_baseline_folder(parent, "task-w", bare.as_uri(), "main", "")
+    # nothing was pushed to the bare remote
+    out, _, _ = subprocess_run_capture(["git", "--git-dir", str(bare), "ls-remote", "--heads"])
+    assert out.strip() == ""
+
+
+def subprocess_run_capture(args):
+    import subprocess
+    p = subprocess.run(args, text=True, capture_output=True)
+    return p.stdout, p.stderr, p.returncode
+
+
+def test_canonical_remote_matches_https_and_ssh_forms():
+    f = ws.canonical_remote
+    assert f("https://github.com/StatXzy7/task-x.git") == "github.com/statxzy7/task-x"
+    assert f("git@github.com:StatXzy7/task-x.git") == "github.com/statxzy7/task-x"
+    assert f("https://github.com/StatXzy7/task-y") != f("https://github.com/StatXzy7/task-x")
+    assert f("not-a-remote") == ""
+
+
+def test_ensure_remote_repo_rejects_owner_other_than_login():
+    gh = _FakeGh(existing=None)
+    with pytest.raises(ghutil.GitHubError, match="不一致"):
+        ghutil.ensure_remote_repo("x", "d", private=False, gh=gh, owner="someone-else")
+    assert gh.created == []  # nothing created
+
+
+def test_desk_csrf_and_host_defenses(tmp_path):
+    """C1: only same-loopback application/json POSTs reach the action routes."""
+    import http.client
+    import threading
+    from agent_trace_kit.desk import _ExclusiveServer, DeskServer
+
+    desk = DeskServer(DeskStore(tmp_path / "desk"))
+    httpd = _ExclusiveServer(("127.0.0.1", 0), desk.make_handler())
+    port = httpd.server_address[1]
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        def post(headers, body=b"{}"):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            conn.request("POST", "/api/jobs", body=body, headers=headers)
+            r = conn.getresponse()
+            r.read()
+            return r.status
+
+        # same-origin JSON request is accepted and routed
+        assert post({"Content-Type": "application/json"}) == 200
+        # cross-site "simple" request content type is rejected (forces preflight)
+        assert post({"Content-Type": "text/plain"}) == 415
+        # explicit cross-origin browser request blocked
+        assert post({"Content-Type": "application/json", "Origin": "http://evil.example"}) == 403
+        # DNS-rebinding style Host header blocked
+        assert post({"Content-Type": "application/json", "Host": "evil.example"}) == 403
+        # loopback origin but a different port blocked
+        assert post({"Content-Type": "application/json", "Origin": "http://127.0.0.1:9999"}) == 403
+    finally:
+        httpd.shutdown()
+        httpd.server_close()

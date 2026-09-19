@@ -14,6 +14,7 @@ import shutil
 import stat
 import subprocess
 import time
+import urllib.parse
 from pathlib import Path
 
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
@@ -149,6 +150,28 @@ def commit_permalink(workspace: str | Path, sha: str) -> str:
     return f"{path}/commit/{sha}"
 
 
+def canonical_remote(url: str) -> str:
+    """Normalise an https/ssh/scp git remote to ``host/owner/repo`` (lowercase).
+
+    So an HTTPS URL from ``gh`` and a user's existing SSH origin for the same
+    repository compare equal. Returns "" when the shape is unrecognised.
+    """
+    s = (url or "").strip().removesuffix(".git").rstrip("/")
+    if not s:
+        return ""
+    if "://" in s:
+        parsed = urllib.parse.urlsplit(s)
+        host = parsed.hostname or ""
+        path = parsed.path.lstrip("/")
+    elif "@" in s and ":" in s:  # scp-like: git@github.com:owner/repo
+        user_host, _, path = s.partition(":")
+        host = user_host.rsplit("@", 1)[-1]
+        path = path.lstrip("/")
+    else:
+        return ""
+    return f"{host.lower()}/{path.lower().strip('/')}"
+
+
 def is_ancestor(workspace: str | Path, ancestor_sha: str, descendant_sha: str) -> bool:
     _, _, code = git(
         ["merge-base", "--is-ancestor", ancestor_sha, descendant_sha], workspace, check=False,
@@ -224,6 +247,141 @@ def snapshot_baseline(workspace: str | Path) -> dict[str, str]:
     return {"sha": sha, "branch": branch, "url": commit_permalink(workspace, sha), "remote": remote_url(workspace)}
 
 
+# ---------- one-click baseline provisioning (local folder + GitHub repo) ----------
+
+FALLBACK_GIT_IDENTITY = ("AgentTraceKit Desk", "agenttracekit@users.noreply.github.com")
+
+
+def ensure_local_git_identity(workspace: str | Path) -> None:
+    """Set a repo-local committer identity for any missing global piece.
+
+    Global config is never touched; this is a fallback so ``git commit`` works on
+    machines where the post-install identity step was skipped (a global email
+    without a name, or vice versa, still leaves commit unable to run).
+    """
+    name, email = FALLBACK_GIT_IDENTITY
+    out_email, _, code_email = git(["config", "user.email"], workspace, check=False)
+    out_name, _, code_name = git(["config", "user.name"], workspace, check=False)
+    if not (code_email == 0 and out_email.strip()):
+        git(["config", "user.email", email], workspace)
+    if not (code_name == 0 and out_name.strip()):
+        git(["config", "user.name", name], workspace)
+
+
+def provision_baseline_folder(
+    parent_dir: str | Path,
+    name: str,
+    remote: str,
+    default_branch: str,
+    description: str,
+) -> dict[str, object]:
+    """Make *parent_dir/name* a local checkout of *remote*, seeding it when empty.
+
+    Three starting states are handled:
+
+    - neither local folder nor remote commits exist (freshly created GitHub
+      repo): clone the empty repo, add README/.gitignore, make the initial
+      commit on the default branch and push it
+    - the remote already has commits (reused/existing repo) but no local
+      folder: clone and use it as-is, never injecting a README commit
+    - a local repo folder already exists: verify origin matches, fetch; seed
+      only when it has zero commits
+
+    User files are never overwritten and pushes are never forced.
+    """
+    from .ghutil import DEFAULT_GITIGNORE, INITIAL_COMMIT_MSG, render_readme, validate_repo_name
+
+    parent = Path(parent_dir).resolve()
+    repo_name = name.strip()
+    if not repo_name:
+        raise GitError("仓库名不能为空")
+    if problem := validate_repo_name(repo_name):
+        raise GitError(problem)
+    parent.mkdir(parents=True, exist_ok=True)
+    target = parent / repo_name
+    # Defense in depth: the resolved folder must live directly under parent
+    # (blocks any traversal even if name validation were ever loosened).
+    if target.resolve().parent != parent:
+        raise GitError(f"仓库名越界，拒绝在 {target} 建仓")
+    if target.is_symlink():
+        raise GitError(f"目标路径是符号链接，拒绝跟随：{target}")
+    if target.exists() and not target.is_dir():
+        raise GitError(f"目标已存在且是一个文件（不会改动）：{target}")
+    if target.is_dir() and any(target.iterdir()) and not (target / ".git").is_dir():
+        raise GitError(f"目录已存在且非 git 仓库（不会改动其中文件）：{target}")
+
+    if not (target / ".git").is_dir():
+        # Works for both a normal repo and a brand-new empty GitHub repo
+        # (clone succeeds; HEAD just points at an unborn branch).
+        git(["clone", remote, str(target)], parent, timeout=300)
+
+    origin = remote_url(target)
+    if not origin:
+        git(["remote", "add", "origin", remote.removesuffix(".git") + ".git"], target)
+    elif canonical_remote(origin) != canonical_remote(remote):
+        raise GitError(f"目录已有指向其他远端的 origin（{origin}），拒绝接管：{target}")
+    git(["fetch", "origin", "--quiet"], target, timeout=120, check=False)
+
+    branch = current_branch(target) or default_branch or "main"
+    sha = head_sha(target)
+    if not sha:
+        # Clone can leave HEAD unborn when the remote HEAD points at a branch
+        # that does not exist (fresh bare, or a renamed default branch). If the
+        # remote actually has branches, track the default one (or the first)
+        # instead of mistaking the repo for empty.
+        out, _, code = git(["ls-remote", "--heads", "origin"], target, timeout=120, check=False)
+        if code != 0:
+            raise GitError("无法从远端读取分支列表（网络或鉴权失败），已停止以免误初始化")
+        heads: dict[str, str] = {}
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[1].startswith("refs/heads/"):
+                heads[parts[1][len("refs/heads/"):]] = parts[0]
+        if heads:
+            pick = default_branch if default_branch in heads else next(iter(heads))
+            git(["checkout", "-B", pick, f"origin/{pick}"], target)
+            sha = head_sha(target)
+            branch = current_branch(target) or pick
+    seeded = False
+    if not sha:
+        # Genuinely empty repo (zero remote branches). Refuse to sweep up any
+        # pre-existing user files into a (possibly public) initial push: only
+        # seed when the work tree contains nothing but .git.
+        tracked = git(["status", "--porcelain", "--untracked-files=all"], target, check=False)[0]
+        strangers = [ln for ln in tracked.splitlines() if ln.strip()]
+        if strangers:
+            raise GitError(
+                f"该仓库零提交但工作区已有文件，拒绝自动提交/推送（避免泄露）：{target}；"
+                "请先自行提交这些文件，或清空目录后重试。"
+            )
+        # Pin HEAD to the requested default branch so the commit lands on main.
+        branch = default_branch or "main"
+        git(["symbolic-ref", "HEAD", f"refs/heads/{branch}"], target)
+        if not (target / "README.md").exists():
+            (target / "README.md").write_text(render_readme(repo_name, description), encoding="utf-8")
+        if not (target / ".gitignore").exists():
+            (target / ".gitignore").write_text(DEFAULT_GITIGNORE, encoding="utf-8")
+        ensure_local_git_identity(target)
+        # Commit ONLY the two managed files (never add -A of user content).
+        git(["add", "--", "README.md", ".gitignore"], target)
+        git(["commit", "-m", INITIAL_COMMIT_MSG], target)
+        sha = head_sha(target)
+        if not is_sha40(sha):
+            raise GitError("初始提交后无法读取 40 位 SHA")
+        git(["push", "-u", "origin", f"HEAD:refs/heads/{branch}"], target, timeout=300)
+        seeded = True
+        if not _remote_branch_exists(target, branch):
+            raise GitError(f"push 后远端仍找不到分支 {branch}")
+    return {
+        "path": str(target),
+        "sha": sha,
+        "branch": branch,
+        "url": commit_permalink(target, sha),
+        "remote": remote_url(target),
+        "seeded": seeded,
+    }
+
+
 def prepare_side_workspace(
     baseline_repo: str | Path,
     dest: str | Path,
@@ -274,57 +432,131 @@ def _encode_cwd(path: str | Path) -> str:
     return re.sub(r"[^A-Za-z0-9]", "-", resolved)
 
 
-def session_has_assistant(path: str | Path) -> bool:
-    """True when the transcript contains a real assistant message.
+def _is_api_error_record(rec: dict) -> bool:
+    """A synthetic gateway-error assistant record (CLI-generated, not model output).
 
-    A stream-stalled run still leaves a jsonl holding queue/ai-title records but
-    no assistant turn; such a transcript must not count as a completed attempt.
+    Claude Code marks these explicitly with ``isApiErrorMessage``; the model tag
+    is ``<synthetic>``. A genuine model answer that merely quotes the words
+    "API Error" must never count (the old text-prefix heuristic false-positived
+    on tasks that document HTTP errors).
     """
-    try:
-        with Path(path).open("r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if rec.get("type") == "assistant":
-                    return True
-    except OSError:
-        return False
+    if rec.get("isApiErrorMessage"):
+        return True
+    msg = rec.get("message")
+    if isinstance(msg, dict) and msg.get("model") == "<synthetic>":
+        content = msg.get("content")
+        if isinstance(content, list):
+            text = "".join(
+                c.get("text", "") for c in content
+                if isinstance(c, dict) and c.get("type") == "text"
+            ).strip()
+            if text.startswith("API Error"):
+                return True
     return False
 
 
-def session_turn_complete(path: str | Path) -> bool:
-    """True when the transcript's last tool call was followed by an assistant turn.
+def _assistant_content_flags(rec: dict) -> tuple[bool, bool]:
+    """Return (has_real_text, has_tool_use) for a non-synthetic-error assistant record."""
+    content = rec.get("message", {}).get("content")
+    has_text = False
+    has_tool_use = False
+    if isinstance(content, list):
+        for c in content:
+            if not isinstance(c, dict):
+                continue
+            if c.get("type") == "text" and c.get("text", "").strip():
+                has_text = True
+            elif c.get("type") == "tool_use":
+                has_tool_use = True
+    elif isinstance(content, str) and content.strip():
+        has_text = True
+    return has_text, has_tool_use
 
-    A stream-killed run ends right after a ``tool_result`` user record with no
-    subsequent assistant message — the agentic turn was interrupted and the
-    product cannot count as a completed single-turn session.
+
+def transcript_interruption_reason(path: str | Path) -> str | None:
+    """Mechanically classify a transcript's tail.
+
+    ``None`` means the single turn looks complete. Otherwise a stable code:
+
+    - ``no_assistant``: no real assistant turn in the file
+    - ``api_error``: the turn ended on a synthetic gateway error record
+      (``isApiErrorMessage`` / ``<synthetic>`` model, e.g. seed-code 504) with
+      no prior closing answer — the turn was cut mid-flight
+    - ``dangling_tool_result``: the file ends after the last tool_result with
+      no closing answer (silent SSE stall / killed stream / tool call awaiting
+      a result that never arrived)
+    - ``unreadable``: the file could not be opened
+
+    A synthetic error AFTER a normal closing answer (the CLI's trailing
+    auxiliary request 504s after the turn itself finished) is not a cut:
+    that run exits non-zero but still produced a complete product.
     """
-    saw_tool_result = False
-    assistant_after_last_result = False
     try:
+        records = []
         with Path(path).open("r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 try:
-                    rec = json.loads(line)
+                    records.append(json.loads(line))
                 except json.JSONDecodeError:
                     continue
-                if rec.get("type") != "user":
-                    if rec.get("type") == "assistant" and saw_tool_result:
-                        assistant_after_last_result = True
-                    continue
-                content = rec.get("message", {}).get("content")
-                is_result = (
-                    isinstance(content, list)
-                    and any(isinstance(c, dict) and c.get("type") == "tool_result" for c in content)
-                )
-                if is_result:
-                    saw_tool_result = True
-                    assistant_after_last_result = False
     except OSError:
-        return False
-    return not saw_tool_result or assistant_after_last_result
+        return "unreadable"
+
+    last_result_pos = -1
+    saw_real_assistant = False
+    saw_error_record = False
+    assistant_records: list[tuple[int, dict]] = []
+    for i, rec in enumerate(records):
+        rtype = rec.get("type")
+        if rtype == "assistant":
+            if _is_api_error_record(rec):
+                saw_error_record = True
+            else:
+                saw_real_assistant = True
+                assistant_records.append((i, rec))
+        elif rtype == "user":
+            content = rec.get("message", {}).get("content")
+            if isinstance(content, list) and any(
+                isinstance(c, dict) and c.get("type") == "tool_result" for c in content
+            ):
+                last_result_pos = i
+
+    if not saw_real_assistant:
+        return "api_error" if saw_error_record else "no_assistant"
+
+    tail = [rec for i, rec in assistant_records if i > last_result_pos]
+    if last_result_pos < 0:
+        # No tool calls at all: any real assistant turn is a closed Q&A turn.
+        return None
+
+    if not tail:
+        return "api_error" if saw_error_record else "dangling_tool_result"
+
+    # A trailing synthetic error is benign once a real closer already exists
+    # after the last tool_result (auxiliary post-turn request failed upstream).
+    last = tail[-1]
+    has_text, has_tool_use = _assistant_content_flags(last)
+    if has_tool_use:
+        # Last assistant turn requested another tool whose result never landed.
+        return "dangling_tool_result"
+    if has_text:
+        return None
+    # thinking-only / empty tail: the stream died while the model was working.
+    return "dangling_tool_result"
+
+
+def session_has_assistant(path: str | Path) -> bool:
+    """True when the transcript contains a real (non-synthetic-error) assistant turn."""
+    reason = transcript_interruption_reason(path)
+    return reason not in ("unreadable", "no_assistant")
+
+
+def session_turn_complete(path: str | Path) -> bool:
+    """True when the transcript holds a closed single turn (see transcript_interruption_reason)."""
+    # "no_assistant" preserves the previous vacuous-true behaviour; the runner
+    # additionally requires session_has_assistant, so an empty transcript is
+    # rejected there regardless.
+    return transcript_interruption_reason(path) in (None, "no_assistant")
 
 
 def find_session_jsonl(workspace: str | Path) -> list[dict[str, str]]:

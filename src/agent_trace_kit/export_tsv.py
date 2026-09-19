@@ -19,23 +19,6 @@ HEADERS = [
 ]
 
 
-def _note(job: dict) -> str:
-    parts = []
-    if job.get("env_desc"):
-        parts.append("环境: " + job["env_desc"])
-    note = job.get("review", {}).get("note", "").strip()
-    if note:
-        parts.append(note)
-    failed_checks = []
-    for side_name in ("A", "B"):
-        for c in job["sides"][side_name].get("check_results", []):
-            if c.get("exit_code") not in (0,):
-                failed_checks.append(f"{side_name}:{c['command']}→exit {c['exit_code']}")
-    if failed_checks:
-        parts.append("检查命令: " + "; ".join(failed_checks))
-    return " | ".join(parts)
-
-
 def job_row(job: dict) -> list[str]:
     a, b = job["sides"]["A"], job["sides"]["B"]
     review = job.get("review", {})
@@ -54,9 +37,8 @@ def job_row(job: dict) -> list[str]:
         review.get("validity", ""),
         review.get("conclusion", ""),
         review.get("reason", ""),
-        # QC-side columns: left blank for the reviewer team to fill in.
-        "", "",
-        _note(job),
+        # QC-side columns (内部质检 / 质检反馈 / 备注): left blank for reviewers.
+        "", "", "",
     ]
 
 

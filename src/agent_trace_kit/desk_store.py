@@ -36,8 +36,17 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # often; the watchdog kills a tree with zero CPU/IO/transcript activity and
     # the side is relaunched in-place until it completes.
     "stall_seconds": 240,
-    "side_max_attempts": 6,
+    # Upstream gateway (seed-code) cuts deep-thinking coding turns frequently;
+    # every cut is retried in a fresh baseline copy until a truly complete turn
+    # lands. 12 attempts covers prolonged upstream instability; each attempt can
+    # take up to side_timeout_seconds, so this is a cap, not a quota to spend.
+    "side_max_attempts": 12,
     "activity_poll_seconds": 15,
+    # claude -p permission mode. acceptEdits auto-denies ALL Bash in
+    # non-interactive mode and models burn the whole turn trying workarounds;
+    # side workspaces are throwaway baseline copies, so bypass is the default.
+    # Overridable from the backend settings page.
+    "permission_mode": "bypassPermissions",
     "oss_endpoint": "https://s3.cn-north-1.jdcloud-oss.com",
     "oss_region": "cn-north-1",
     "oss_bucket": "",
@@ -45,6 +54,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "oss_key_prefix": "pairwise",
     "workspace_copy_excludes": "",
     "default_baseline_repo": r"D:\myprojects\GoletaLab数据标注\github-base\logistic-irls",
+    # One-click provisioning: a new task only needs a repo name; the folder is
+    # created here and an empty GitHub repo is created under the logged-in user.
+    "baseline_parent_dir": r"D:\myprojects\GoletaLab数据标注\github-base",
+    "github_owner": "",          # empty == gh api user (the authenticated account)
+    "github_private": False,     # match existing public baselines (evaluation side needs access)
     "default_task_type": "0-1代码生成",
     "default_difficulty": "困难",
     "default_repro_level": "无外部依赖",
@@ -92,8 +106,9 @@ class DeskStore:
         with _LOCK:
             current = self.settings()
             patch = dict(patch)
-            if "default_baseline_repo" in patch:
-                patch["default_baseline_repo"] = clean_path(patch["default_baseline_repo"])
+            for path_key in ("default_baseline_repo", "baseline_parent_dir"):
+                if path_key in patch:
+                    patch[path_key] = clean_path(patch[path_key])
             current.update({k: v for k, v in patch.items() if k in DEFAULT_SETTINGS or k in current})
             self._atomic_write_json(self.settings_path, current)
             return current
@@ -115,7 +130,7 @@ class DeskStore:
             settings = self.settings()
             job = {
                 "id": job_id,
-                "name": data.get("name") or job_id,
+                "name": data.get("name") or str(data.get("github_repo", "")).strip() or job_id,
                 "prompt": data["prompt"],
                 "task_type": data.get("task_type") or settings["default_task_type"],
                 "difficulty": data.get("difficulty") or settings["default_difficulty"],
@@ -125,6 +140,16 @@ class DeskStore:
                 "check_commands": data.get("check_commands", ""),
                 "copy_excludes": data.get("copy_excludes", ""),
                 "baseline_repo": clean_path(data.get("baseline_repo", "")),
+                # One-click provisioning fields. github_repo drives auto-create;
+                # github_readme is the initial blurb; baseline_parent_dir/github_owner/
+                # github_private fall back to settings when blank.
+                "github_repo": str(data.get("github_repo", "")).strip(),
+                "github_readme": str(data.get("github_readme", "")).strip(),
+                "github_private": bool(data.get("github_private", settings.get("github_private", False))),
+                "github_owner": str(data.get("github_owner", "") or settings.get("github_owner", "")).strip(),
+                "baseline_parent_dir": clean_path(
+                    data.get("baseline_parent_dir", "") or settings.get("baseline_parent_dir", "")
+                ),
                 "baseline_sha": "",
                 "baseline_url": "",
                 "harness": "Claude Code",

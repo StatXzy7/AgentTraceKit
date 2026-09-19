@@ -11,6 +11,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from . import ghutil
 from . import oss as oss_mod
 from . import workspace as ws
 from .checklist import run_checklist
@@ -36,6 +37,7 @@ input,textarea,select{width:100%;padding:8px;border:1px solid #b8c2d1;border-rad
 textarea{min-height:80px;resize:vertical}
 button{padding:8px 13px;border:0;border-radius:6px;background:var(--blue);color:#fff;cursor:pointer;font:inherit}
 button.sec{background:#475569}button.ghost{background:#e5e7eb;color:#111}button:disabled{opacity:.45;cursor:not-allowed}
+a.ghostbtn{display:inline-block;padding:8px 13px;border-radius:6px;background:#e5e7eb;color:#111;text-decoration:none;font-size:14px}
 .btns{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
 table{width:100%;border-collapse:collapse;font-size:13px}th,td{border-bottom:1px solid var(--line);padding:7px 8px;text-align:left;vertical-align:top}
 th{background:#f8fafc;position:sticky;top:0}
@@ -53,7 +55,7 @@ a{color:var(--blue)}
 .progress{height:6px;background:#e5e7eb;border-radius:4px;overflow:hidden}.progress>i{display:block;height:100%;background:var(--blue)}
 </style></head><body>
 <header><h1>Pair 交付台</h1><span class="muted" style="color:#94a3b8">同模型 · 同环境 · 同提示词 · A/B 双跑</span><span class="sp"></span>
-<button class="ghost" onclick="openSettings()">⚙ 设置</button>
+<a class="ghostbtn" href="/settings">⚙ 后台设置</a>
 <button class="ghost" onclick="loadJobs()">🔄 刷新</button></header>
 <div class="wrap">
 
@@ -73,58 +75,41 @@ a{color:var(--blue)}
     <label>难度<select id="c_difficulty"></select></label>
     <label>语言/框架<input id="c_stack" placeholder="Go, Gin / Python, FastAPI"></label>
     <label>环境可复现等级<select id="c_repro"></select></label>
-    <label>运行环境说明<input id="c_env" placeholder="go version go1.26.0 linux/amd64（选填）"></label>
     <label>任务名（可选）<input id="c_name"></label>
   </div>
-  <label>基线仓库目录（已提交初始代码、已配好远端的仓库）<input id="c_baseline" placeholder="D:\work\my-task-repo"></label>
+  <div class="grid3">
+    <label style="grid-column:span 2">GitHub 仓库名（本地文件夹同名，字母数字 - _ .）
+      <input id="c_repo" placeholder="my-task-repo" oninput="repoCheck()"></label>
+    <label>仓库可见性<select id="c_private">
+      <option value="0">公开（评测方可直接访问，默认）</option>
+      <option value="1">私有</option>
+    </select></label>
+  </div>
+  <label>README 说明文字（可选，留空写占位说明）<input id="c_readme" placeholder="一句话说明这个题目的初始仓库"></label>
+  <div id="repoHint" class="kv" style="margin:4px 0 8px"></div>
+  <details><summary class="muted" style="cursor:pointer">高级：自定义基线父目录 / 直接使用已有的本地仓库</summary>
+    <div class="grid3" style="margin-top:8px">
+      <label>基线父目录（留空用后台默认）<input id="c_parent" oninput="repoCheck()"></label>
+      <label style="grid-column:1/-1">已有本地基线仓库目录（填写后跳过自动建仓，直接快照）<input id="c_baseline" placeholder="D:\work\my-task-repo"></label>
+    </div>
+  </details>
   <label>验收命令（每行一条，仅记录结果，不影响证据；如 go test ./...）<textarea id="c_checks"></textarea></label>
-  <div class="btns"><button onclick="createJob()">创建并准备（快照基线 + 复制 A/B 工作区）</button>
+  <div class="btns"><button onclick="createJob(event)">创建：建 GitHub 空仓 + 初始化 main → 复制 A/B 工作区 → 自动开跑</button>
   <button class="ghost" onclick="hideCreate()">取消</button></div>
 </div>
 
 <div id="batchPanel" class="card" style="display:none">
   <h2 style="margin-top:0">批量导入</h2>
-  <p class="muted">每行一条任务，格式：<b>提示词</b>；或 TSV：<b>提示词⇥任务类型⇥难度⇥语言/框架⇥基线仓库目录</b>。所有任务共用下方基线目录（TSV 第 5 列可逐行覆盖）。</p>
-  <textarea id="b_lines" style="min-height:160px" placeholder="实现一个支持事件时间和故障恢复的流处理引擎&#10;实现一个限流器库	0-1代码生成	地狱	Go, Redis	D:\work\task-2"></textarea>
+  <p class="muted">每行一条任务，格式：<b>提示词</b>；或 TSV：<b>提示词⇥任务类型⇥难度⇥语言/框架⇥GitHub 仓库名</b>（第 5 列也可填本地已有仓库的完整路径，会自动判别）。仓库在下方父目录下同名创建并自动建 GitHub 空仓。</p>
+  <textarea id="b_lines" style="min-height:160px" placeholder="实现一个支持事件时间和故障恢复的流处理引擎&#10;实现一个限流器库	0-1代码生成	地狱	Go, Redis	rate-limiter-lib"></textarea>
   <div class="grid3">
     <label>默认任务类型<select id="b_task_type"></select></label>
     <label>默认难度<select id="b_difficulty"></select></label>
     <label>默认语言/框架<input id="b_stack"></label>
-    <label>默认基线仓库（每行未指定时用它）<input id="b_baseline"></label>
+    <label>基线父目录（新仓库的本地文件夹建在这里）<input id="b_parent"></label>
   </div>
   <div class="btns"><button onclick="createBatch()">批量创建 → 全部准备 → 入队运行</button>
   <button class="ghost" onclick="hideBatch()">取消</button></div>
-</div>
-
-<div id="settingsPanel" class="card" style="display:none">
-  <h2 style="margin-top:0">设置</h2>
-  <div class="grid">
-    <div class="grid3" style="grid-column:1/-1">
-      <label>claude 命令<input id="s_claude"></label>
-      <label>最多并行 pair 数<input id="s_parallel" type="number" min="1" max="6"></label>
-      <label>单侧超时（秒）<input id="s_timeout" type="number"></label>
-    <label>断流判定（秒无活动）<input id="s_stall" type="number" min="30"></label>
-    <label>单侧最多自动重试次数<input id="s_attempts" type="number" min="1" max="20"></label>
-      <label>OSS Endpoint<input id="s_endpoint"></label>
-      <label>OSS 区域<input id="s_region"></label>
-      <label>OSS Bucket<input id="s_bucket"></label>
-      <label>公网访问基址（留空用 path-style）<input id="s_pubbase"></label>
-      <label>对象 key 前缀<input id="s_prefix"></label>
-      <label>默认基线仓库<input id="s_baseline" placeholder="D:\work\my-task-repo"></label>
-      <label>默认标注员<input id="s_reviewer"></label>
-    </div>
-  </div>
-  <div class="card" style="background:#f8fafc;margin:10px 0">
-    <b>京东云密钥</b>（只放在 <span class="mono" id="secretPath"></span>，不进仓库）<br>
-    <span class="muted">文件内容两行：OSS_ACCESS_KEY_ID=... 和 OSS_SECRET_ACCESS_KEY=...</span>
-    <div class="kv" id="ossStatus" style="margin-top:6px"></div>
-    <div class="btns">
-      <button class="sec" onclick="saveSettings()">保存设置</button>
-      <button class="ghost" onclick="ossTest()">测试连接 / 列出 bucket</button>
-      <button class="ghost" onclick="ossCreate()">创建 bucket（不存在时）</button>
-    </div>
-  </div>
-  <button class="ghost" onclick="hideSettings()">关闭</button>
 </div>
 
 <div class="card">
@@ -135,6 +120,28 @@ a{color:var(--blue)}
 </div>
 
 <div id="detail" style="display:none"></div>
+<div id="follow" style="display:none;position:fixed;inset:0;background:rgba(15,23,42,.55);z-index:50" onclick="if(event.target===this)closeFollow()">
+  <div style="background:#0f172a;color:#e2e8f0;border-radius:10px;margin:24px auto;max-width:1400px;height:calc(100vh - 48px);display:flex;flex-direction:column;padding:14px 16px">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px">
+      <b style="font-size:15px">📡 实时跟随 · <span id="followTitle"></span></b>
+      <span class="muted" style="color:#94a3b8;font-size:12px">只读旁观，不会影响后台任务；日志每 2 秒刷新</span>
+      <span style="flex:1"></span>
+      <label style="margin:0;font-weight:400;color:#cbd5e1;font-size:12px"><input type="checkbox" id="followAutoscroll" checked style="width:auto;margin-right:5px">自动滚到底</label>
+      <button class="ghost" onclick="clearFollow()">清屏</button>
+      <button class="ghost" onclick="closeFollow()">关闭</button>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;flex:1;min-height:0">
+      <div style="display:flex;flex-direction:column;min-height:0">
+        <div style="color:#7dd3fc;font-weight:600;margin-bottom:4px">A 侧 <span id="followStateA" class="muted" style="font-weight:400"></span></div>
+        <pre id="followLogA" style="flex:1;margin:0;background:#020617;border-radius:8px;padding:10px;overflow:auto;white-space:pre-wrap;font:12px/1.5 Consolas,monospace"></pre>
+      </div>
+      <div style="display:flex;flex-direction:column;min-height:0">
+        <div style="color:#7dd3fc;font-weight:600;margin-bottom:4px">B 侧 <span id="followStateB" class="muted" style="font-weight:400"></span></div>
+        <pre id="followLogB" style="flex:1;margin:0;background:#020617;border-radius:8px;padding:10px;overflow:auto;white-space:pre-wrap;font:12px/1.5 Consolas,monospace"></pre>
+      </div>
+    </div>
+  </div>
+</div>
 <div class="toast" id="toast"></div>
 
 <script>
@@ -153,52 +160,75 @@ function sideStatus(s){const map={pending:"待运行",preparing:"准备中",runn
   const cls=s==="done"?"g":s==="failed"?"r":s==="running"?"y":"r";
   return `<span class="dot ${cls}"></span>${map[s]||s}`}
 
-async function loadSettings(){SETTINGS=await api("/api/settings_get");
-  $("s_claude").value=SETTINGS.claude_command;$("s_parallel").value=SETTINGS.max_parallel_pairs;
-  $("s_timeout").value=SETTINGS.side_timeout_seconds;$("s_stall").value=SETTINGS.stall_seconds;
-  $("s_attempts").value=SETTINGS.side_max_attempts;$("s_endpoint").value=SETTINGS.oss_endpoint;
-  $("s_region").value=SETTINGS.oss_region;$("s_bucket").value=SETTINGS.oss_bucket;
-  $("s_pubbase").value=SETTINGS.oss_public_base;$("s_prefix").value=SETTINGS.oss_key_prefix;
-  $("s_baseline").value=SETTINGS.default_baseline_repo||"";
-  $("s_reviewer").value=SETTINGS.reviewer;$("secretPath").textContent=SETTINGS.secret_path;
-  const st=SETTINGS.oss;$("ossStatus").innerHTML=st.configured
-    ?`已配置：${esc(st.endpoint)} / bucket=<b>${esc(st.bucket)}</b> / key=${esc(st.access_key_id_preview)}`
-    :`<span class="bad">未配置（endpoint/bucket 或密钥缺失）</span>`;
+async function loadDefaults(){SETTINGS=await api("/api/settings_get");
   fillSelect($("c_task_type"),__TASK_TYPES__,SETTINGS.default_task_type);
   fillSelect($("b_task_type"),__TASK_TYPES__,SETTINGS.default_task_type);
   fillSelect($("c_difficulty"),__DIFF__,SETTINGS.default_difficulty);
   fillSelect($("b_difficulty"),__DIFF__,SETTINGS.default_difficulty);
   fillSelect($("c_repro"),__REPRO__,SETTINGS.default_repro_level);
-  $("c_baseline").value=$("c_baseline").value||SETTINGS.default_baseline_repo||"";
-  $("b_baseline").value=SETTINGS.default_baseline_repo||"";
+  $("c_parent").placeholder=SETTINGS.baseline_parent_dir||"";
+  $("c_parent").value=$("c_parent").value||"";
+  $("c_private").value=SETTINGS.github_private?"1":"0";
+  $("b_parent").value=SETTINGS.baseline_parent_dir||"";
+  repoCheck();
 }
-async function saveSettings(){const body={claude_command:$("s_claude").value,max_parallel_pairs:+$("s_parallel").value,
- side_timeout_seconds:+$("s_timeout").value,stall_seconds:+$("s_stall").value,
- side_max_attempts:+$("s_attempts").value,oss_endpoint:$("s_endpoint").value,oss_region:$("s_region").value,
- oss_bucket:$("s_bucket").value,oss_public_base:$("s_pubbase").value,oss_key_prefix:$("s_prefix").value,
- default_baseline_repo:$("s_baseline").value,
- reviewer:$("s_reviewer").value};SETTINGS=await api("/api/settings_save",body);toast("设置已保存")}
-async function ossTest(){const x=await api("/api/oss_test",{endpoint:$("s_endpoint").value,region:$("s_region").value,bucket:$("s_bucket").value});
- toast(x.ok?("连接成功，bucket: "+(x.buckets||[]).join(", ")+(x.bucket_present?"（目标 bucket 存在）":"（目标 bucket 不存在，可点创建）")):("失败: "+x.error),!x.ok)}
-async function ossCreate(){const x=await api("/api/oss_create",{endpoint:$("s_endpoint").value,region:$("s_region").value,bucket:$("s_bucket").value});
- toast(x.existed?"bucket 已存在":"bucket 已创建: "+x.name)}
+
+let repoCheckTimer=null;
+function repoCheck(){
+  const name=$("c_repo").value.trim(), hint=$("repoHint");
+  clearTimeout(repoCheckTimer);
+  if(!name){hint.innerHTML="";return;}
+  const local=(($("c_parent").value.trim()||SETTINGS.baseline_parent_dir||"")+"\\"+name);
+  hint.textContent="查询中… 本地将创建于 "+local;
+  repoCheckTimer=setTimeout(async()=>{
+    try{
+      const x=await api("/api/repo_check",{name});
+      if(x.syntax_error){hint.innerHTML='<span class="bad">✗ '+esc(x.syntax_error)+'</span>';return;}
+      if(x.gh_error){hint.innerHTML='<span class="bad">✗ '+esc(x.gh_error)+'</span><br>本地将创建于 '+esc(local);return;}
+      if(x.exists){hint.innerHTML='<span class="warn">⚠ 远端已存在 <b>'+esc(x.full_name)+'</b>（'+esc(x.visibility.toLowerCase())+'），将直接复用并推送 main，不会重建</span><br>本地：'+esc(local);}
+      else{hint.innerHTML='<span class="ok">✓ 名称可用，将在 GitHub 新建 <b>'+esc(x.full_name)+'</b> 空仓并初始化 main</span><br>本地：'+esc(local);}
+    }catch(e){/* toast already shown */}
+  },350);
+}
 
 function showCreate(){$("createPanel").style.display="block";$("batchPanel").style.display="none"}
 function hideCreate(){$("createPanel").style.display="none"}
 function showBatch(){$("batchPanel").style.display="block";$("createPanel").style.display="none"}
 function hideBatch(){$("batchPanel").style.display="none"}
-function openSettings(){$("settingsPanel").style.display="block"}
-function hideSettings(){$("settingsPanel").style.display="none"}
 
 async function createJob(){
+  const explicit=$("c_baseline").value.trim();
+  const repo=$("c_repo").value.trim();
+  if(!explicit && !repo){toast("请填写 GitHub 仓库名（或在高级选项里指定已有本地仓库）",true);return;}
   const body={prompt:$("c_prompt").value,task_type:$("c_task_type").value,difficulty:$("c_difficulty").value,
-   stack:$("c_stack").value,repro_level:$("c_repro").value,env_desc:$("c_env").value,name:$("c_name").value,
-   baseline_repo:$("c_baseline").value,check_commands:$("c_checks").value};
-  await api("/api/job_create",body);$("c_prompt").value="";hideCreate();toast("已创建并开始准备");loadJobs()}
+   stack:$("c_stack").value,repro_level:$("c_repro").value,name:$("c_name").value,
+   github_repo:explicit?"":repo,github_readme:$("c_readme").value,
+   github_private:$("c_private").value==="1",baseline_parent_dir:$("c_parent").value,
+   baseline_repo:explicit,check_commands:$("c_checks").value};
+  const btn=event.target;btn.disabled=true;btn.textContent="创建中（建仓 + 初始化 main + 复制 A/B）…";
+  try{
+    const x=await api("/api/job_create",body);
+    $("c_prompt").value="";$("c_repo").value="";$("c_readme").value="";$("c_baseline").value="";repoCheck();
+    hideCreate();
+    if(x.prepare_error){
+      toast("已建仓但准备失败："+x.prepare_error,true);
+    }else{
+      const prov=x.provisioned;
+      toast(prov
+        ?`已创建：GitHub ${prov.created?"新建":"复用"} ${esc(prov.github.owner)}/${esc(prov.github.name)}${prov.seeded?"（已初始化 main）":""}，A/B 自动开跑`
+        :"已创建并开始准备");
+    }
+    loadJobs();
+  }finally{btn.disabled=false;btn.textContent="创建：建 GitHub 空仓 + 初始化 main → 复制 A/B 工作区 → 自动开跑";}
+}
 async function createBatch(){
   const body={lines:$("b_lines").value,task_type:$("b_task_type").value,difficulty:$("b_difficulty").value,
-   stack:$("b_stack").value,baseline_repo:$("b_baseline").value};
-  const x=await api("/api/job_batch",body);toast(`已创建 ${x.created.length} 条，准备完成 ${x.prepared.length} 条`);$("b_lines").value="";hideBatch();loadJobs()}
+   stack:$("b_stack").value,baseline_parent_dir:$("b_parent").value};
+  const x=await api("/api/job_batch",body);
+  toast(`已创建 ${x.created.length} 条，准备完成 ${x.prepared.length} 条`+(x.errors.length?`，${x.errors.length} 条异常见详情`:""));
+  $("b_lines").value="";hideBatch();loadJobs();
+  if(x.errors.length)alert(x.errors.join("\n"));
+}
 
 async function loadJobs(){JOBS=(await api("/api/jobs")).jobs;renderRows();if(SEL)renderDetail(SEL)}
 function renderRows(){
@@ -222,7 +252,7 @@ function renderDetail(id){SEL=id;const j=JOBS.find(x=>x.id===id);if(!j)return;
     <div class="btns" style="margin-top:0"><button class="ghost" onclick="closeDetail()">← 返回列表</button>
     <span style="font-weight:700;font-size:15px;align-self:center">${esc(j.name)}</span><span class="sp" style="flex:1"></span>
     <span class="tag t-${j.status}">${stName(j.status)}</span></div>
-    <div class="kv" style="margin:6px 0">基线：${j.baseline_url?`<a href="${esc(j.baseline_url)}" target="_blank" class="mono">${esc(j.baseline_sha.slice(0,12))}</a>`:"未准备"} · ${esc(j.harness)} ${esc(j.harness_version)} · ${esc(j.os_name)}</div>
+    <div class="kv" style="margin:6px 0">${j.github_url?`仓库：<a href="${esc(j.github_url)}" target="_blank" class="mono">${esc(j.github_repo||j.github_url)}</a>${j.github_created===true?"（本次新建）":""} · `:""}基线：${j.baseline_url?`<a href="${esc(j.baseline_url)}" target="_blank" class="mono">${esc(j.baseline_sha.slice(0,12))}</a>`:"未准备"} · ${esc(j.harness)} ${esc(j.harness_version)} · ${esc(j.os_name)}</div>
     <div class="grid">
       ${sideHtml(j,"A")}${sideHtml(j,"B")}
     </div>
@@ -231,6 +261,7 @@ function renderDetail(id){SEL=id;const j=JOBS.find(x=>x.id===id);if(!j)return;
       <button class="sec" onclick="act('enqueue')">② 开始/重试运行</button>
       <button class="ghost" onclick="refreshDetail()">↻ 刷新检查</button>
       <button class="ghost" onclick="act('collect')">重新采集会话</button>
+      <button class="ghost" onclick="followOnly=null;startFollow()">📡 同时跟随 A/B</button>
       <button class="ghost" style="margin-left:auto;color:#b91c1c" onclick="deleteJob()">删除任务（清理工作区和证据）</button>
     </div>
     <div class="grid" style="margin-top:8px">
@@ -266,12 +297,10 @@ function renderDetail(id){SEL=id;const j=JOBS.find(x=>x.id===id);if(!j)return;
   </div>
 
   <div class="card"><h3 style="margin-top:0">④ GSB 人工判断（严禁 AI 代写）</h3>
-    <div class="grid3">
+    <div class="grid">
       <label>有效性<select id="r_validity"><option value="">请选择</option>${__VALIDITY__.map(x=>`<option ${x===j.review.validity?"selected":""}>${x}</option>`).join("")}</select></label>
       <label>结论<select id="r_conclusion"><option value="">请选择</option>${__CONCLUSIONS__.map(x=>`<option ${x===j.review.conclusion?"selected":""}>${x}</option>`).join("")}</select></label>
-      <label>标注员<input id="r_reviewer" value="${esc(j.review.reviewer||"")}"></label>
     </div>
-    <label>备注（仅本工具内部导出，质检列留空）<input id="r_note" value="${esc(j.review.note||"")}"></label>
     <label>GSB 理由（A、B 分别说明；Same 至少 80 字，其余 30 字以上；作废时可简述原因）<textarea id="r_reason" style="min-height:140px">${esc(j.review.reason||"")}</textarea></label>
     <div class="btns"><button onclick="saveReview()">保存 GSB</button>
     <button class="sec" onclick="exportRow()" ${c.ready?"":"disabled"}>⑤ 生成 TSV（全部绿灯后可用）</button></div>
@@ -294,7 +323,8 @@ function sideHtml(j,s){const x=j.sides[s];const run=x.status==="running";
   ${x.error?`<span class="bad">${esc(x.error)}</span>`:""}</div>
   <div class="btns"><button class="ghost" ${run?"disabled":""} title="${run?"运行中不能重跑，请先中止":""}" onclick="sideAct('retry','${s}')">重跑该侧</button>
   <button class="ghost" ${run?"":"disabled"} onclick="sideAct('abort','${s}')">中止</button>
-  <button class="ghost" onclick="openLog('${s}')">运行日志</button></div></div>`}
+  <button class="ghost" onclick="openLog('${s}')">运行日志</button>
+  <button class="ghost" onclick="followSide('${s}')">📡 实时跟随</button></div></div>`}
 function checksHtml(items){if(!items||!items.length)return '<span class="muted">点「刷新检查」</span>';
   const groups={};items.forEach(i=>{(groups[i.group]=groups[i.group]||[]).push(i)});
   return Object.entries(groups).map(([g,xs])=>`<div style="margin:6px 0"><b>${esc(g)}</b><br>${xs.map(x=>
@@ -305,11 +335,37 @@ async function act(a){const body={job:SEL,action:a,video_a:$("vA")? $("vA").valu
 async function deleteJob(){if(!confirm("确定删除该任务？将清理 A/B 工作区、证据文件和任务记录（已 push 的远端分支保留），不可恢复。"))return;await act("delete");toast("任务已删除")}
 async function sideAct(a,s){await api("/api/side_action",{job:SEL,side:s,action:a});await refreshDetail()}
 async function refreshDetail(online){const j=await api("/api/job",{id:SEL,online:!!online});const f=JOBS.findIndex(x=>x.id===SEL);if(f>=0)JOBS[f]=j;renderRows();renderDetail(SEL)}
-async function saveReview(){await api("/api/review",{job:SEL,validity:$("r_validity").value,conclusion:$("r_conclusion").value,reason:$("r_reason").value,reviewer:$("r_reviewer").value,note:$("r_note").value});toast("GSB 已保存");refreshDetail()}
+async function saveReview(){await api("/api/review",{job:SEL,validity:$("r_validity").value,conclusion:$("r_conclusion").value,reason:$("r_reason").value});toast("GSB 已保存");refreshDetail()}
 async function exportRow(){const x=await api("/api/export",{job:SEL});$("tsvBox").style.display="block";$("tsvPre").textContent=x.tsv;window.__tsv=x.tsv}
 function copyTsv(){navigator.clipboard.writeText(window.__tsv||"");toast("已复制，去飞书表格粘贴（整行）")}
 function downloadTsv(){const b=new Blob([window.__tsv||""],{type:"text/tab-separated-values"});const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download=SEL+".tsv";a.click()}
 async function openLog(s){const x=await api("/api/log",{job:SEL,side:s});const w=window.open("","_blank");w.document.write(`<pre style="font:12px Consolas;white-space:pre-wrap">${esc(x.log||"(空)")}</pre>`)}
+
+// ---- live log following (read-only tail of run.log) ----
+let followTimer=null, followOff={A:0,B:0}, followOnly=null;
+function followSide(s){followOnly=s;startFollow()}
+function startFollow(){
+  followOff={A:0,B:0};["A","B"].forEach(s=>$("followLog"+s).textContent="");
+  $("followTitle").textContent=SEL+(followOnly?` · 只看 ${followOnly} 侧`:" · A/B 双侧");
+  if(followOnly){$("followLog"+followOnly).closest("div").style.gridColumn="1 / -1";["A","B"].filter(x=>x!==followOnly).forEach(x=>$("followLog"+x).closest("div").style.display="none")}
+  $("follow").style.display="block";
+  clearInterval(followTimer);tickFollow();followTimer=setInterval(tickFollow,2000);
+}
+async function tickFollow(){
+  if(!SEL)return;
+  const j=await api("/api/job",{id:SEL}).catch(()=>null);
+  for(const s of ["A","B"]){
+    if(followOnly&&s!==followOnly)continue;
+    if(j&&j.sides&&j.sides[s])$("followState"+s).textContent="· "+sideStatus(j.sides[s].status);
+    let x;try{x=await fetch("/api/log_tail",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({job:SEL,side:s,offset:followOff[s]})}).then(r=>r.json())}catch(e){continue}
+    if(typeof x.offset!=="number")continue;
+    if(x.offset<followOff[s]){$("followLog"+s).textContent="";followOff[s]=0} // rotated
+    if(x.text){const el=$("followLog"+s);const stick=$("followAutoscroll").checked&&(el.scrollTop+el.clientHeight>=el.scrollHeight-30);el.textContent+=x.text;if(stick)el.scrollTop=el.scrollHeight}
+    followOff[s]=x.offset;
+  }
+}
+function clearFollow(){["A","B"].forEach(s=>{followOff[s]=0;$("followLog"+s).textContent=""})}
+function closeFollow(){clearInterval(followTimer);followTimer=null;followOnly=null;$("follow").style.display="none";["A","B"].forEach(s=>{const c=$("followLog"+s).closest("div");c.style.display="";c.style.gridColumn=""})}
 async function pickVideo(s){const x=await api("/api/pick_file",{side:s});if(x.path){$("v"+s).value=x.path}}
 
 let recTimers={};
@@ -331,8 +387,151 @@ async function recRefresh(s){
   }
 }
 
-loadSettings().then(loadJobs);
+loadDefaults().then(loadJobs);
 pollTimer=setInterval(()=>{if(JOBS.some(j=>["running","ready"].includes(j.status)||Object.values(j.sides).some(x=>["running","preparing"].includes(x.status))))loadJobs()},5000);
+</script></body></html>"""
+
+
+SETTINGS_PAGE = r"""<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>后台设置 · Pair 交付台</title>
+<style>
+:root{--bg:#f4f5f8;--card:#fff;--line:#dde2ea;--ink:#1f2937;--muted:#6b7280;--blue:#2563eb;--bad:#b91c1c}
+*{box-sizing:border-box}body{margin:0;font:14px/1.5 system-ui,"Segoe UI",sans-serif;background:var(--bg);color:var(--ink)}
+header{background:#0f172a;color:#fff;padding:12px 20px;display:flex;align-items:center;gap:14px}
+header h1{font-size:16px;margin:0}header .sp{flex:1}
+.wrap{max-width:900px;margin:18px auto;padding:0 16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin:14px 0}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
+label{display:block;font-weight:600;margin:8px 0 3px;font-size:13px}
+input{width:100%;padding:8px;border:1px solid #b8c2d1;border-radius:6px;font:inherit;background:#fff}
+button{padding:8px 13px;border:0;border-radius:6px;background:var(--blue);color:#fff;cursor:pointer;font:inherit}
+button.sec{background:#475569}button.ghost{background:#e5e7eb;color:#111}
+.btns{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.muted{color:var(--muted)}.bad{color:var(--bad)}.ok{color:#15803d}
+.mono{font-family:ui-monospace,Consolas,monospace;font-size:12px}
+.kv{font-size:12px;color:var(--muted);word-break:break-all}
+.toast{position:fixed;right:18px;bottom:18px;background:#111827;color:#fff;padding:10px 14px;border-radius:8px;display:none;max-width:420px}
+a{color:var(--blue)}.hint{background:#f8fafc;border:1px solid var(--line);border-radius:8px;padding:10px;margin:10px 0;font-size:13px}
+</style></head><body>
+<header><h1>Pair 交付台 · 后台设置</h1><span class="sp"></span><a href="/" style="color:#cbd5e1">← 返回标注台</a></header>
+<div class="wrap">
+
+<div class="card">
+  <h2 style="margin-top:0">运行引擎</h2>
+  <p class="muted" style="margin:0 0 6px">上游（seed-code 网关）深度思考编码轮经常静默断流或中途 504；遇到断流会自动放弃残缺轮、重新复制干净基线副本并重试，直到拿到完整轮次。</p>
+  <div class="grid3">
+    <label>claude 命令<input id="s_claude"></label>
+    <label>最多并行 pair 数<input id="s_parallel" type="number" min="1" max="6"></label>
+    <label>单侧总超时（秒）<input id="s_timeout" type="number" min="300"></label>
+    <label>断流判定（秒无活动）<input id="s_stall" type="number" min="30"></label>
+    <label>单侧最多自动重试次数（最小 12）<input id="s_attempts" type="number" min="12" max="50"></label>
+    <label>活动轮询间隔（秒）<input id="s_poll" type="number" min="5"></label>
+    <label title="-p 非交互下 acceptEdits 会自动拒绝所有 Bash，模型会空转整轮；工作区是一次性副本，默认完全放行">
+      运行权限模式
+      <select id="s_perm">
+        <option value="bypassPermissions">bypassPermissions（完全放行，推荐）</option>
+        <option value="acceptEdits">acceptEdits（只放行文件编辑，Bash 会被拒）</option>
+        <option value="dontAsk">dontAsk（拒绝需授权项，不弹询问）</option>
+        <option value="plan">plan（只读规划，不执行）</option>
+      </select>
+    </label>
+  </div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">默认值</h2>
+  <div class="grid3">
+    <label style="grid-column:1/-1">基线父目录（新任务只填仓库名时，本地文件夹建在这里）
+      <input id="s_parent" placeholder="D:\myprojects\GoletaLab数据标注\github-base"></label>
+    <label>GitHub 归属账号（通常留空即可；填写则必须与 gh 登录账号一致）<input id="s_owner" placeholder="留空 = 当前登录账号"></label>
+    <label>新仓库默认可见性<select id="s_private">
+      <option value="0">公开</option>
+      <option value="1">私有</option>
+    </select></label>
+    <label style="grid-column:1/-1;font-weight:400">
+      <span class="muted">兼容旧流程：已有本地基线仓库时，在新建任务面板「高级」里直接填目录即可。</span>
+      <input id="s_baseline" type="hidden"></label>
+  </div>
+  <div class="grid3">
+    <label>TSV 提交人（飞书按账号标注，一般无需改）<input id="s_reviewer"></label>
+  </div>
+  <div id="ghStatus" class="hint" style="margin-top:10px"></div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">京东云 OSS</h2>
+  <div class="grid3">
+    <label>OSS Endpoint<input id="s_endpoint"></label>
+    <label>OSS 区域<input id="s_region"></label>
+    <label>OSS Bucket<input id="s_bucket"></label>
+    <label>公网访问基址（留空用 path-style）<input id="s_pubbase"></label>
+    <label>对象 key 前缀<input id="s_prefix"></label>
+  </div>
+  <div class="hint">
+    <b>京东云密钥</b>只放在 <span class="mono" id="secretPath"></span>，不进仓库。<br>
+    文件内容两行：<span class="mono">OSS_ACCESS_KEY_ID=...</span> 和 <span class="mono">OSS_SECRET_ACCESS_KEY=...</span>
+    <div class="kv" id="ossStatus" style="margin-top:6px"></div>
+  </div>
+  <div class="btns">
+    <button class="sec" onclick="saveSettings()">保存设置</button>
+    <button class="ghost" onclick="ossTest()">测试连接 / 列出 bucket</button>
+    <button class="ghost" onclick="ossCreate()">创建 bucket（不存在时）</button>
+  </div>
+</div>
+
+</div>
+<div class="toast" id="toast"></div>
+<script>
+const $=id=>document.getElementById(id);
+function esc(s){return String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
+function toast(m,bad){const t=$("toast");t.textContent=m;t.style.background=bad?"#7f1d1d":"#111827";t.style.display="block";setTimeout(()=>t.style.display="none",4000)}
+async function api(path,body){
+  const r=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:body?JSON.stringify(body):"{}"});
+  const x=await r.json().catch(()=>({error:"bad json"}));if(!r.ok||x.ok===false){toast(x.error||"请求失败",true);throw x}return x}
+let SETTINGS={};
+async function load(){SETTINGS=await api("/api/settings_get");
+  $("s_claude").value=SETTINGS.claude_command;$("s_parallel").value=SETTINGS.max_parallel_pairs;
+  $("s_timeout").value=SETTINGS.side_timeout_seconds;$("s_stall").value=SETTINGS.stall_seconds;
+  $("s_attempts").value=Math.max(12,SETTINGS.side_max_attempts);$("s_poll").value=SETTINGS.activity_poll_seconds;
+  $("s_perm").value=SETTINGS.permission_mode||"bypassPermissions";
+  $("s_endpoint").value=SETTINGS.oss_endpoint;$("s_region").value=SETTINGS.oss_region;
+  $("s_bucket").value=SETTINGS.oss_bucket;$("s_pubbase").value=SETTINGS.oss_public_base||"";
+  $("s_prefix").value=SETTINGS.oss_key_prefix;$("s_baseline").value=SETTINGS.default_baseline_repo||"";
+  $("s_parent").value=SETTINGS.baseline_parent_dir||"";$("s_owner").value=SETTINGS.github_owner||"";
+  $("s_private").value=SETTINGS.github_private?"1":"0";
+  $("s_reviewer").value=SETTINGS.reviewer||"";$("secretPath").textContent=SETTINGS.secret_path;
+  ghStatus();
+  const st=SETTINGS.oss;$("ossStatus").innerHTML=st.configured
+    ?`已配置：${esc(st.endpoint)} / bucket=<b>${esc(st.bucket)}</b> / key=${esc(st.access_key_id_preview)}`
+    :`<span class="bad">未配置（endpoint/bucket 或密钥缺失）</span>`;
+}
+async function saveSettings(){const body={claude_command:$("s_claude").value,max_parallel_pairs:+$("s_parallel").value,
+ side_timeout_seconds:+$("s_timeout").value,stall_seconds:+$("s_stall").value,
+ side_max_attempts:Math.max(12,+$("s_attempts").value),activity_poll_seconds:+$("s_poll").value,
+ permission_mode:$("s_perm").value,
+ oss_endpoint:$("s_endpoint").value,oss_region:$("s_region").value,
+ oss_bucket:$("s_bucket").value,oss_public_base:$("s_pubbase").value,oss_key_prefix:$("s_prefix").value,
+ default_baseline_repo:$("s_baseline").value,
+ baseline_parent_dir:$("s_parent").value,github_owner:$("s_owner").value,
+ github_private:$("s_private").value==="1",
+ reviewer:$("s_reviewer").value};
+ SETTINGS=await api("/api/settings_save",body);toast("设置已保存（新任务/下一次重试运行时生效）")}
+async function ghStatus(){
+  const el=$("ghStatus");if(!el)return;
+  el.innerHTML='<span class="muted">检测 gh 登录状态…</span>';
+  try{
+    const x=await api("/api/gh_status",{});
+    el.innerHTML=x.login
+      ?`<span class="ok">✓ gh 已登录：<b>${esc(x.login)}</b>（新仓库将建在此账号下）</span>`
+      :`<span class="bad">✗ ${esc(x.error||"gh 未登录")} — 请在终端执行 <code>gh auth login</code>（需 repo 权限）</span>`;
+  }catch(e){el.innerHTML='<span class="bad">✗ 状态检测失败</span>';}
+}
+async function ossTest(){const x=await api("/api/oss_test",{endpoint:$("s_endpoint").value,region:$("s_region").value,bucket:$("s_bucket").value});
+ toast(x.ok?("连接成功，bucket: "+(x.buckets||[]).join(", ")+(x.bucket_present?"（目标 bucket 存在）":"（目标 bucket 不存在，可点创建）")):("失败: "+x.error),!x.ok)}
+async function ossCreate(){const x=await api("/api/oss_create",{endpoint:$("s_endpoint").value,region:$("s_region").value,bucket:$("s_bucket").value});
+ toast(x.existed?"bucket 已存在":"bucket 已创建: "+x.name)}
+load();
 </script></body></html>"""
 
 
@@ -350,6 +549,17 @@ class DeskServer:
         self.recorder = Recorder(store)
         self.port = port
         self._lock_fp = None
+        self._gh_login_cache: tuple[str, float] | None = None
+
+    def _gh_login(self, *, ttl_seconds: float = 60.0) -> str:
+        """Cached gh login to avoid spawning `gh api user` on every keystroke probe."""
+        import time as _time
+        now = _time.time()
+        if self._gh_login_cache and now - self._gh_login_cache[1] < ttl_seconds:
+            return self._gh_login_cache[0]
+        login = ghutil.CliGh().viewer_login()  # raises GitHubError when logged out
+        self._gh_login_cache = (login, now)
+        return login
 
     def _acquire_singleton_lock(self) -> bool:
         """Cross-process exclusive lock; False when another desk owns it."""
@@ -386,10 +596,12 @@ class DeskServer:
     # ---------- actions ----------
     def job_create(self, body: dict, prepare: bool = True) -> dict:
         job = self.store.create_job(body)
-        result = {"job": job["id"], "prepared": []}
-        if prepare and body.get("baseline_repo"):
+        result: dict = {"job": job["id"], "prepared": [], "provisioned": None}
+        needs_baseline = bool(body.get("baseline_repo") or body.get("github_repo"))
+        if prepare and needs_baseline:
             try:
-                self.runner.prepare(job["id"])
+                prep = self.runner.prepare(job["id"])
+                result["provisioned"] = prep.get("provisioned")
                 result["prepared"].append(job["id"])
                 self.runner.enqueue(job["id"])
             except Exception as exc:
@@ -397,27 +609,44 @@ class DeskServer:
                 result["prepare_error"] = str(exc)
         return result
 
+    @staticmethod
+    def _looks_like_local_path(value: str) -> bool:
+        """Heuristic separating an existing-repo path from a bare GitHub repo name."""
+        v = value.strip()
+        if not v:
+            return False
+        if "\\" in v or "/" in v:
+            return True
+        # X: style drive prefix without backslashes is rare but cheap to catch.
+        return len(v) >= 2 and v[1] == ":"
+
     def job_batch(self, body: dict) -> dict:
         import csv as _csv
         import io as _io
         created: list[str] = []
         prepared: list[str] = []
         errors: list[str] = []
-        default_baseline = clean_path(body.get("baseline_repo", ""))
+        default_parent = clean_path(body.get("baseline_parent_dir", ""))
         for raw in _io.StringIO(body.get("lines", "")):
             line = raw.rstrip("\n").rstrip("\r")
             if not line.strip():
                 continue
             row = next(_csv.reader(_io.StringIO(line), delimiter="\t"))
+            fifth = row[4].strip() if len(row) > 4 else ""
+            is_path = self._looks_like_local_path(fifth)
             data = {
                 "prompt": row[0].strip(),
                 "task_type": (row[1] if len(row) > 1 and row[1].strip() else body.get("task_type")),
                 "difficulty": (row[2] if len(row) > 2 and row[2].strip() else body.get("difficulty")),
                 "stack": (row[3] if len(row) > 3 and row[3].strip() else body.get("stack")),
-                "baseline_repo": (row[4] if len(row) > 4 and row[4].strip() else default_baseline),
+                # A path-like 5th column reuses an existing local repo; anything
+                # else is treated as a GitHub repo name to auto-provision.
+                "baseline_repo": fifth if is_path else "",
+                "github_repo": "" if is_path else fifth,
+                "baseline_parent_dir": default_parent,
             }
-            if not data["prompt"] or not data["baseline_repo"]:
-                errors.append(f"跳过（缺提示词或基线目录）: {data['prompt'][:30]}")
+            if not data["prompt"] or not (data["baseline_repo"] or data["github_repo"]):
+                errors.append(f"跳过（缺提示词或仓库名/目录）: {data['prompt'][:30]}")
                 continue
             res = self.job_create(data, prepare=True)
             created.append(res["job"])
@@ -490,10 +719,18 @@ class DeskServer:
         wdir = side.get("workspace", "")
         if not wdir or not Path(wdir).is_dir():
             return
-        sessions = ws.find_session_jsonl(wdir)
-        if not sessions:
-            return
-        chosen = sessions[0]
+        # Only a genuinely complete turn is eligible evidence: a newest session
+        # whose tail is a gateway API Error or a dangling tool_result is a cut
+        # turn and must not be re-bound over a side.
+        complete = [
+            s for s in ws.find_session_jsonl(wdir)
+            if ws.transcript_interruption_reason(s["path"]) is None
+        ]
+        if not complete:
+            raise RuntimeError(
+                f"{side_name} 侧工作区里找不到完整首轮会话（最新会话疑似被网关截断）；请点「重跑该侧」"
+            )
+        chosen = complete[0]
         kept = self.store.evidence_dir(job_id) / f"{side_name.lower()}-{chosen['session_id']}.jsonl"
         shutil.copyfile(chosen["path"], kept)
         self.store.update_side(job_id, side_name, {
@@ -520,8 +757,40 @@ class DeskServer:
         server = self
 
         class Handler(BaseHTTPRequestHandler):
+            # Hostnames a browser is allowed to reach this loopback server under.
+            _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
+
             def log_message(self, *_):  # quiet
                 pass
+
+            def _reject(self, status: int, message: str) -> bool:
+                self._send({"ok": False, "error": message}, status)
+                return False
+
+            def _host_ok(self) -> bool:
+                """Allow only loopback Host headers (defeats DNS rebinding)."""
+                host = (self.headers.get("Host") or "").strip()
+                if not host:
+                    return self._reject(400, "缺少 Host 头")
+                hostname = (urllib.parse.urlsplit("//" + host).hostname or "").lower()
+                if hostname not in self._LOOPBACK_HOSTS:
+                    return self._reject(403, "拒绝非本地 Host（防 DNS rebinding）")
+                return True
+
+            def _origin_ok(self) -> bool:
+                """When an Origin is present (browsers always send one on POST),
+                require it to be the same loopback origin — a cross-site fetch
+                is rejected before any action runs."""
+                origin = (self.headers.get("Origin") or "").strip()
+                if not origin:
+                    return True  # non-browser clients (curl, same-origin GET) send none
+                parsed = urllib.parse.urlsplit(origin)
+                hostname = (parsed.hostname or "").lower()
+                if hostname not in self._LOOPBACK_HOSTS:
+                    return self._reject(403, "拒绝跨域来源")
+                if parsed.port and parsed.port != self.server.server_address[1]:
+                    return self._reject(403, "跨端口来源被拒绝")
+                return True
 
             def _send(self, value, status=200):
                 data = json.dumps(value, ensure_ascii=False).encode("utf-8")
@@ -532,6 +801,12 @@ class DeskServer:
                 self.wfile.write(data)
 
             def _body(self):
+                # A cross-origin "simple" POST can only send form/plain content
+                # types; demanding application/json forces a CORS preflight the
+                # loopback server never grants (no Access-Control headers).
+                ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+                if ctype != "application/json":
+                    return None  # caller responds 415
                 n = int(self.headers.get("Content-Length", "0"))
                 if not n:
                     return {}
@@ -541,6 +816,8 @@ class DeskServer:
                     return {}
 
             def do_GET(self):
+                if not (self._host_ok() and self._origin_ok()):
+                    return
                 path = urllib.parse.urlparse(self.path).path
                 if path == "/":
                     data = PAGE.replace("__TASK_TYPES__", json.dumps(TASK_TYPES, ensure_ascii=False)) \
@@ -555,11 +832,24 @@ class DeskServer:
                     self.end_headers()
                     self.wfile.write(raw)
                     return
+                if path == "/settings":
+                    raw = SETTINGS_PAGE.encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
                 self._send({"error": "not found"}, 404)
 
             def do_POST(self):
+                if not (self._host_ok() and self._origin_ok()):
+                    return
                 path = urllib.parse.urlparse(self.path).path
                 body = self._body()
+                if body is None:
+                    self._send({"ok": False, "error": "仅接受 Content-Type: application/json"}, 415)
+                    return
                 try:
                     self._send(self._route(path, body))
                 except FileNotFoundError as exc:
@@ -584,6 +874,10 @@ class DeskServer:
                     return oss_mod.ensure_bucket(cfg)
                 if path == "/api/jobs":
                     return {"jobs": server.store.list_jobs()}
+                if path == "/api/repo_check":
+                    return server.repo_check(body)
+                if path == "/api/gh_status":
+                    return server.gh_status()
                 if path == "/api/job_create":
                     return server.job_create(body)
                 if path == "/api/job_batch":
@@ -603,6 +897,24 @@ class DeskServer:
                 if path == "/api/log":
                     p = server.store.evidence_dir(body["job"]) / f"{body['side'].lower()}-run.log"
                     return {"log": p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""}
+                if path == "/api/log_tail":
+                    p = server.store.evidence_dir(body["job"]) / f"{body['side'].lower()}-run.log"
+                    try:
+                        offset = int(body.get("offset", 0))
+                    except (TypeError, ValueError):
+                        offset = 0
+                    if not p.exists():
+                        return {"text": "", "offset": 0, "size": 0, "mtime": 0}
+                    size = p.stat().st_size
+                    # File was rotated/truncated (new attempt rewrites the log): restart.
+                    if offset > size:
+                        offset = 0
+                    with p.open("rb") as f:
+                        f.seek(offset)
+                        raw = f.read(96 * 1024)
+                    return {"text": raw.decode("utf-8", errors="replace"),
+                            "offset": min(size, offset + len(raw)),
+                            "size": size, "mtime": p.stat().st_mtime}
                 if path == "/api/pick_file":
                     return server._pick_file(body.get("side", "A"))
                 if path == "/api/rec_start":
@@ -614,6 +926,45 @@ class DeskServer:
                 return {"ok": False, "error": f"unknown path {path}"}
 
         return Handler
+
+    def gh_status(self) -> dict:
+        """Report the authenticated gh login (settings page indicator)."""
+        try:
+            return {"login": self._gh_login()}
+        except ghutil.GitHubError as exc:
+            return {"login": "", "error": str(exc)}
+
+    def repo_check(self, body: dict) -> dict:
+        """Validate a repo name and probe the remote (existence/visibility).
+
+        Never raises for an expected gh failure: the UI keeps working and shows
+        the gh error (e.g. not logged in) next to the still-usable local path.
+        """
+        name = str(body.get("name", "")).strip()
+        problem = ghutil.validate_repo_name(name)
+        if problem:
+            return {"name": name, "syntax_error": problem, "exists": False}
+        settings = self.store.settings()
+        configured_owner = str(settings.get("github_owner", "")).strip()
+        parent = clean_path(body.get("parent_dir", "") or settings.get("baseline_parent_dir", ""))
+        local_path = str(Path(parent) / name) if parent else name
+        try:
+            cli = ghutil.CliGh()
+            login = cli.viewer_login()
+            if configured_owner and configured_owner.lower() != login.lower():
+                return {"name": name, "full_name": "", "exists": False,
+                        "gh_error": f"后台设置的归属账号 {configured_owner} 与当前 gh 登录账号 {login} 不一致",
+                        "local_path": local_path}
+            repo = cli.repo_view(login, name)
+        except ghutil.GitHubError as exc:
+            return {"name": name, "full_name": "", "exists": False,
+                    "gh_error": str(exc), "local_path": local_path}
+        if repo is None:
+            return {"name": name, "full_name": f"{login}/{name}", "exists": False,
+                    "local_path": local_path}
+        return {"name": repo.name, "full_name": repo.full_name, "exists": True,
+                "visibility": repo.visibility.lower(), "default_branch": repo.default_branch,
+                "url": repo.url, "local_path": local_path}
 
     def _pick_file(self, side: str) -> dict:
         """Native file dialog via PowerShell (runs on the desktop, not a service)."""
