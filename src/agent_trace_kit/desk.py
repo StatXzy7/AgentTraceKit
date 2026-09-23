@@ -5,6 +5,8 @@ Run with:  python -m agent_trace_kit.desk  (or  atk desk)
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import threading
 import urllib.parse
 import webbrowser
@@ -13,10 +15,11 @@ from pathlib import Path
 
 from . import ghutil
 from . import oss as oss_mod
+from . import ports as ports_mod
 from . import workspace as ws
 from .checklist import run_checklist
 from .desk_store import CONCLUSIONS, DIFFICULTIES, REPRO_LEVELS, TASK_TYPES, VALIDITY, DeskStore, clean_path
-from .export_tsv import HEADERS, export_tsv, job_row, upload_side
+from .export_tsv import export_tsv, upload_side
 from .recorder import Recorder
 from .runner import PairRunner
 
@@ -53,6 +56,13 @@ a{color:var(--blue)}
 .sidebox h3{margin:0 0 8px;font-size:14px}
 .kv{font-size:12px;color:var(--muted);word-break:break-all}
 .progress{height:6px;background:#e5e7eb;border-radius:4px;overflow:hidden}.progress>i{display:block;height:100%;background:var(--blue)}
+.tabs{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.tabbtn{background:#e5e7eb;color:#374151;font-weight:600;padding:6px 14px;border-radius:8px 8px 0 0;border:1px solid var(--line);border-bottom:0}
+.tabbtn.active{background:var(--card);color:var(--blue);box-shadow:0 -2px 0 var(--blue) inset}
+.badge{display:inline-block;min-width:18px;padding:0 6px;border-radius:20px;background:#cbd5e1;color:#1f2937;font-size:11px;font-weight:700;text-align:center;margin-left:5px}
+.tabbtn.active .badge{background:#dbeafe;color:var(--blue)}
+.rowarch{opacity:.55}.rowarch:hover{opacity:1}
+.t-archived{background:#e2e8f0;color:#475569}
 </style></head><body>
 <header><h1>Pair 交付台</h1><span class="muted" style="color:#94a3b8">同模型 · 同环境 · 同提示词 · A/B 双跑</span><span class="sp"></span>
 <a class="ghostbtn" href="/settings">⚙ 后台设置</a>
@@ -64,6 +74,16 @@ a{color:var(--blue)}
     <button onclick="showCreate()">＋ 新建任务</button>
     <button class="sec" onclick="showBatch()">📋 批量导入提示词</button>
     <span class="muted" style="align-self:center">并行队列自动运行；你只需要录产物视频 + 写 GSB。</span>
+  </div>
+</div>
+
+<div class="card" id="portHubCard">
+  <h2 style="margin:0 0 8px">本机端口（全部任务）
+    <span class="muted" style="font-weight:400"> · 预览和 npm 残留都在这里关，不要打开 8080 上已有的页</span></h2>
+  <div id="portHubBody" class="kv muted">扫描中…</div>
+  <div class="btns">
+    <button class="ghost" type="button" onclick="portHubRefresh()">重新扫描</button>
+    <button class="sec" type="button" onclick="portsReapAll()">停止全部预览并清理残留</button>
   </div>
 </div>
 
@@ -113,9 +133,17 @@ a{color:var(--blue)}
 </div>
 
 <div class="card">
-  <h2 style="margin:0 0 8px">任务队列</h2>
-  <table><thead><tr><th>状态</th><th>任务</th><th>类型/难度</th><th>A</th><th>B</th><th>证据</th><th>GSB</th><th></th></tr></thead>
+  <div class="tabs" style="margin-bottom:0">
+    <h2 style="margin:0 8px 0 0">任务队列</h2>
+    <button id="tabActive" class="tabbtn active" onclick="setView('active')">待办<span id="cntActive" class="badge">0</span></button>
+    <button id="tabArch" class="tabbtn" onclick="setView('archived')">已归档<span id="cntArch" class="badge">0</span></button>
+    <span style="flex:1"></span>
+    <input id="jobFilter" oninput="renderRows()" placeholder="🔍 搜索任务名 / 类型 / 仓库"
+           style="width:240px;font-weight:400">
+  </div>
+  <table style="margin-top:10px"><thead><tr><th>状态</th><th>任务</th><th>类型/难度</th><th>A</th><th>B</th><th>证据</th><th>GSB</th><th></th></tr></thead>
   <tbody id="jobRows"><tr><td colspan="8" class="muted">加载中…</td></tr></tbody></table>
+  <p class="kv" style="margin:8px 2px 0">归档只从默认队列隐藏，不删除证据；切到「已归档」可随时恢复。运行中的任务需先结束才能归档。</p>
 </div>
 </div>
 
@@ -142,11 +170,20 @@ a{color:var(--blue)}
     </div>
   </div>
 </div>
+<div id="delModal" style="display:none;position:fixed;inset:0;background:rgba(15,23,42,.55);z-index:60">
+  <div style="background:#fff;border-radius:10px;margin:16vh auto;max-width:480px;padding:18px 20px">
+    <h3 style="margin-top:0">删除任务</h3>
+    <p id="delWarn" style="margin:6px 0"></p>
+    <div id="delOpts" style="margin:10px 0"></div>
+    <div class="btns"><button style="background:#b91c1c" onclick="doDelete()">确认删除</button>
+    <button class="ghost" onclick="$('delModal').style.display='none'">取消</button></div>
+  </div>
+</div>
 <div class="toast" id="toast"></div>
 
 <script>
 const $=id=>document.getElementById(id);
-let JOBS=[], SEL=null, SETTINGS={}, pollTimer=null;
+let JOBS=[], SEL=null, SETTINGS={}, pollTimer=null, jobsInflight=false, CHECKS={}, JOB_VIEW="active";
 
 function esc(s){return String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
 function toast(m,bad){const t=$("toast");t.textContent=m;t.style.background=bad?"#7f1d1d":"#111827";t.style.display="block";setTimeout(()=>t.style.display="none",4000)}
@@ -156,8 +193,11 @@ async function api(path,body){
 }
 function fillSelect(el,vals,cur){el.innerHTML=vals.map(v=>`<option ${v===cur?"selected":""}>${v}</option>`).join("")}
 function initSelects(){[["c_task_type","b_task_type"]].forEach(pair=>{})}
-function sideStatus(s){const map={pending:"待运行",preparing:"准备中",running:"运行中",collecting:"采集中",done:"完成",failed:"失败"};
-  const cls=s==="done"?"g":s==="failed"?"r":s==="running"?"y":"r";
+function sideBusy(x){return !!(x&&x.live)||["running","preparing","collecting"].includes(x&&x.status)}
+function sideStatus(s, live){
+  if(live && !["collecting","done"].includes(s||"")) s="running";
+  const map={pending:"待运行",preparing:"准备中",running:"运行中",collecting:"采集中",done:"完成",failed:"失败"};
+  const cls=s==="done"?"g":s==="failed"?"r":(s==="running"||s==="preparing"||s==="collecting")?"y":"r";
   return `<span class="dot ${cls}"></span>${map[s]||s}`}
 
 async function loadDefaults(){SETTINGS=await api("/api/settings_get");
@@ -230,65 +270,190 @@ async function createBatch(){
   if(x.errors.length)alert(x.errors.join("\n"));
 }
 
-async function loadJobs(){JOBS=(await api("/api/jobs")).jobs;renderRows();if(SEL)renderDetail(SEL)}
+async function loadJobs(isPoll){
+  if(jobsInflight)return;
+  jobsInflight=true;
+  try{
+    JOBS=attachChecks((await api("/api/jobs")).jobs);renderRows();portHubRefresh();if(SEL)renderDetail(SEL,false,isPoll)
+  }finally{jobsInflight=false}
+}
+function attachChecks(jobs){
+  // /api/jobs may omit check; keep the last report so polling cannot blank the
+  // export button a few seconds after 「刷新检查」. Drop the overlay when the
+  // evidence fingerprint changed, so we don't keep a stale red/green.
+  return (jobs||[]).map(j=>{
+    const slot=CHECKS[j.id];
+    const c=j.check||(slot&&slot.fp===j.check_fp?slot.check:null);
+    if(c){CHECKS[j.id]={check:c,fp:j.check_fp};return Object.assign({},j,{check:c})}
+    if(slot)delete CHECKS[j.id];
+    return j;
+  });
+}
+function jobCheck(j){
+  const slot=j&&CHECKS[j.id];
+  const c=(j&&j.check)||(slot&&slot.fp===j.check_fp&&slot.check);
+  return c||{items:[],ready:false,blocking_count:0,warning_count:0};
+}
+function isArchived(j){return !!j.archived}
+function setView(v){JOB_VIEW=v;
+  $("tabActive").classList.toggle("active",v==="active");
+  $("tabArch").classList.toggle("active",v==="archived");
+  renderRows();
+}
+function jobMatchesFilter(j,q){
+  if(!q)return true;
+  const hay=[j.name,j.task_type,j.difficulty,j.stack,j.github_repo,j.id].filter(Boolean).join(" ").toLowerCase();
+  return hay.includes(q);
+}
+function visibleJobs(){
+  const q=($("jobFilter").value||"").trim().toLowerCase();
+  return JOBS.filter(j=>isArchived(j)===(JOB_VIEW==="archived")&&jobMatchesFilter(j,q));
+}
 function renderRows(){
-  $("jobRows").innerHTML=JOBS.map(j=>{const a=j.sides.A,b=j.sides.B;
+  const active=JOBS.filter(j=>!isArchived(j)).length;
+  const arch=JOBS.length-active;
+  $("cntActive").textContent=active; $("cntArch").textContent=arch;
+  const rows=visibleJobs();
+  $("jobRows").innerHTML=rows.map(j=>{const a=j.sides.A,b=j.sides.B;
    const ev=[a.jsonl_local,b.jsonl_local,a.video_url||a.video_local,b.video_url||b.video_local].filter(Boolean).length;
-   const gsb=j.review.conclusion?`<b>${esc(j.review.conclusion)}</b>`:'<span class="muted">待标注</span>';
-   return `<tr><td><span class="tag t-${j.status}">${stName(j.status)}</span></td>
-   <td><a href="#" onclick="renderDetail('${j.id}');return false">${esc(j.name)}</a><div class="kv">${esc(j.task_type)} · ${esc(j.difficulty)} · ${esc(j.stack)}</div></td>
+   const rv=j.review||{};
+   const gsb=rv.locked_at
+     ? `<span class="ok">✓ 已标注</span>${rv.conclusion?` <span class="kv">${esc(rv.conclusion)}</span>`:""}`
+     : (rv.conclusion
+        ? `${esc(rv.conclusion)} <span class="warn" title="已选结论但尚未生成 TSV/锁定">未提交</span>`
+        : '<span class="muted">待标注</span>');
+   const busy=Object.values(j.sides).some(x=>x.live||["running","preparing","collecting"].includes(x.status));
+   const arcBtn=isArchived(j)
+     ? `<button class="ghost" title="恢复到待办队列" onclick="archiveJob('${j.id}',false)">↩ 恢复</button>`
+     : `<button class="ghost" title="归档后从默认队列隐藏，不删除" ${busy?"disabled":""}
+              onclick="archiveJob('${j.id}',true)">📦 归档</button>`;
+   const statusTag=isArchived(j)
+     ? `<span class="tag t-archived">已归档</span>`
+     : `<span class="tag t-${j.status}">${stName(j.status)}</span>`;
+   return `<tr class="${isArchived(j)?"rowarch":""}"><td>${statusTag}</td>
+   <td><a href="#" onclick="openJob('${j.id}');return false">${esc(j.name)}</a><div class="kv">${esc(j.task_type)} · ${esc(j.difficulty)} · ${esc(j.stack)}</div></td>
    <td>${esc(j.task_type)}<br><span class="kv">${esc(j.difficulty)}</span></td>
-   <td>${sideStatus(a.status)}<div class="kv">${esc((a.session_id||"").slice(0,8))}</div></td>
-   <td>${sideStatus(b.status)}<div class="kv">${esc((b.session_id||"").slice(0,8))}</div></td>
+   <td>${sideStatus(a.status, a.live)}<div class="kv">${esc((a.session_id||"").slice(0,8))}</div></td>
+   <td>${sideStatus(b.status, b.live)}<div class="kv">${esc((b.session_id||"").slice(0,8))}</div></td>
    <td>${ev}/4</td><td>${gsb}</td>
-   <td><button class="ghost" onclick="renderDetail('${j.id}')">打开</button></td></tr>`}).join("") || '<tr><td colspan="8" class="muted">还没有任务</td></tr>';
+   <td style="white-space:nowrap">${arcBtn}
+   <button class="ghost" onclick="openJob('${j.id}')">打开</button></td></tr>`}).join("")
+   || `<tr><td colspan="8" class="muted">${JOB_VIEW==="archived"?"还没有已归档任务":"没有匹配的任务（可切换到「已归档」或修改搜索）"}</td></tr>`;
+}
+async function archiveJob(id,on){
+  try{
+    await api("/api/job_action",{job:id,action:on?"archive":"unarchive"});
+    if(on&&SEL===id)closeDetail();
+    await loadJobs();
+    toast(on?"已归档（可在「已归档」中恢复）":"已恢复到待办队列");
+  }catch(e){/* toast already shown */}
 }
 function stName(s){return {draft:"草稿",ready:"待运行",running:"运行中",evidence_ready:"待标注",failed:"有失败",done:"已完成"}[s]||s}
 
-function renderDetail(id){SEL=id;const j=JOBS.find(x=>x.id===id);if(!j)return;
+function renderDetail(id,scroll,isPoll){const prevSel=SEL;
+  const fid=document.activeElement?document.activeElement.id:"";
+  const formIds=["r_validity","r_conclusion","r_reason","r_a_delivery_score","r_a_delivery_description","r_b_delivery_score","r_b_delivery_description","r_aic","vA","vB"];
+  const detailOpen=$("detail").style.display==="block";
+  // Polling must not rebuild the detail DOM while the operator is editing the
+  // GSB form (an IME composing pinyin would be cancelled) or pasting a path.
+  // Job data is still refreshed in JOBS; the DOM catches up on the next render.
+  if(isPoll&&detailOpen&&prevSel===id&&formIds.includes(fid)){SEL=id;return}
+  SEL=id;const j=JOBS.find(x=>x.id===id);if(!j)return;
+  const wasSame=detailOpen&&prevSel===id;
+  if(!wasSame){recActive={A:false,B:false};recPrimed={A:false,B:false};vDirty.A=vDirty.B=false;recWinSel.A=recWinSel.B="";["A","B"].forEach(s=>clearInterval(recTimers[s]))}
+  if(wasSame)captureDetailDraft();
   const D=$("detail");D.style.display="block";
-  const c=j.check||{items:[],ready:false,blocking_count:0,warning_count:0};
+  const locked=!!(j.review&&j.review.locked_at);
+  const c=jobCheck(j);
   D.innerHTML=`<div class="card">
     <div class="btns" style="margin-top:0"><button class="ghost" onclick="closeDetail()">← 返回列表</button>
     <span style="font-weight:700;font-size:15px;align-self:center">${esc(j.name)}</span><span class="sp" style="flex:1"></span>
-    <span class="tag t-${j.status}">${stName(j.status)}</span></div>
+    ${locked?'<span class="tag" style="background:#fef3c7" title="后端拒绝重跑/重新准备/重新采集">🔒 评审已锁定</span>':""}
+    ${j.archived?'<span class="tag t-archived" title="已从默认队列隐藏，可恢复">📦 已归档</span>':""}
+    <span class="tag t-${j.status}">${stName(j.status)}</span>
+    ${j.archived
+      ? '<button class="ghost" onclick="archiveJob(\''+j.id+'\',false)">↩ 恢复到待办</button>'
+      : '<button class="ghost" title="归档后从默认队列隐藏，不删除证据" onclick="archiveJob(\''+j.id+'\',true)">📦 归档</button>'}
+    </div>
     <div class="kv" style="margin:6px 0">${j.github_url?`仓库：<a href="${esc(j.github_url)}" target="_blank" class="mono">${esc(j.github_repo||j.github_url)}</a>${j.github_created===true?"（本次新建）":""} · `:""}基线：${j.baseline_url?`<a href="${esc(j.baseline_url)}" target="_blank" class="mono">${esc(j.baseline_sha.slice(0,12))}</a>`:"未准备"} · ${esc(j.harness)} ${esc(j.harness_version)} · ${esc(j.os_name)}</div>
     <div class="grid">
       ${sideHtml(j,"A")}${sideHtml(j,"B")}
     </div>
     <div class="btns">
-      <button onclick="act('prepare')">① 重新准备/校验基线</button>
-      <button class="sec" onclick="act('enqueue')">② 开始/重试运行</button>
+      <button onclick="act('prepare')" ${locked?"disabled title='评审已锁定，请先在 GSB 区解锁'":""}>① 重新准备/校验基线</button>
+      <button class="sec" onclick="act('enqueue')" ${locked?"disabled":""}>② 开始/重试运行</button>
       <button class="ghost" onclick="refreshDetail()">↻ 刷新检查</button>
-      <button class="ghost" onclick="act('collect')">重新采集会话</button>
+      <button class="ghost" onclick="act('collect')" ${locked?"disabled":""}>重新采集会话</button>
       <button class="ghost" onclick="followOnly=null;startFollow()">📡 同时跟随 A/B</button>
       <button class="ghost" style="margin-left:auto;color:#b91c1c" onclick="deleteJob()">删除任务（清理工作区和证据）</button>
     </div>
     <div class="grid" style="margin-top:8px">
       <div class="sidebox"><h3>🎥 A 侧录屏</h3>
-        <div id="recA" class="kv muted">未开始</div>
+        <label style="font-weight:400">录制范围
+          <select id="recWinA" onchange="recWinSel.A=this.value"><option value="">全屏：终端 + Web 切换全过程（推荐，真实验收）</option></select>
+        </label>
+        <div id="recA" class="kv ${j.sides.A.video_url||j.sides.A.video_local?'ok':'muted'}">${recSavedHtml(j,'A')}</div>
         <div class="btns" style="margin-top:6px">
           <button onclick="recStart('A')">● 开始录屏</button>
-          <button class="sec" id="recStopA" onclick="recStop('A')" disabled>■ 停止并保存</button>
+          <button class="sec" id="recStopA" onclick="recStop('A')" disabled>■ 运行结束，停止</button>
           <button class="ghost" type="button" onclick="pickVideo('A')">选择已有文件…</button>
         </div>
-        <input id="vA" value="${esc(j.sides.A.video_local||"")}" style="margin-top:6px" placeholder="也可直接粘贴 mp4 路径">
+        <input id="vA" oninput="vDirty.A=true" value="${esc(j.sides.A.video_local||"")}" style="margin-top:6px" placeholder="也可直接粘贴 mp4 路径">
       </div>
       <div class="sidebox"><h3>🎥 B 侧录屏</h3>
-        <div id="recB" class="kv muted">未开始</div>
+        <label style="font-weight:400">录制范围
+          <select id="recWinB" onchange="recWinSel.B=this.value"><option value="">全屏：终端 + Web 切换全过程（推荐，真实验收）</option></select>
+        </label>
+        <div id="recB" class="kv ${j.sides.B.video_url||j.sides.B.video_local?'ok':'muted'}">${recSavedHtml(j,'B')}</div>
         <div class="btns" style="margin-top:6px">
           <button onclick="recStart('B')">● 开始录屏</button>
-          <button class="sec" id="recStopB" onclick="recStop('B')" disabled>■ 停止并保存</button>
+          <button class="sec" id="recStopB" onclick="recStop('B')" disabled>■ 运行结束，停止</button>
           <button class="ghost" type="button" onclick="pickVideo('B')">选择已有文件…</button>
         </div>
-        <input id="vB" value="${esc(j.sides.B.video_local||"")}" style="margin-top:6px" placeholder="也可直接粘贴 mp4 路径">
+        <input id="vB" oninput="vDirty.B=true" value="${esc(j.sides.B.video_local||"")}" style="margin-top:6px" placeholder="也可直接粘贴 mp4 路径">
       </div>
     </div>
-    <p class="kv muted" style="margin:6px 2px">录主屏幕（含声音以外的全部画面），<b>产物运行结束就点停止</b>，没有时长上限；失败也要录。录完点「保存录屏路径」再上传 OSS。</p>
+    <p class="kv muted" style="margin:6px 2px">录制<b>真实运行</b>：建议全屏，从干净状态启动产物，终端命令和浏览器操作都会入镜；<b>产物运行结束立即点停止</b>，几秒即可，最长 89 秒会自动停止；失败的产物也要录。也可只录单个窗口，或绑定外部录好的 mp4。</p>
     <div class="btns">
       <button class="sec" onclick="act('set_videos')">保存录屏路径</button>
       <button onclick="act('upload')">③ 上传轨迹+录屏到 OSS</button>
     </div>
+  </div>
+
+  <div class="card" id="portCard">
+    <h3 style="margin-top:0">⚠ 验收端口助手
+      <span class="muted" style="font-weight:400"> · 勿把 Steam CEF / Inspectable WebContents 当成产物</span></h3>
+    <p class="kv" style="margin:0 0 8px">Windows 上 <b>127.0.0.1:8080</b> 经常被 Steam 或<strong>上一题预览</strong>占用。点「空闲端口预览」只会打开<b>本题刚绑定的新端口</b>，并先关掉其他任务的预览。终端出现 <span class="mono">EADDRINUSE</span> 时，<b>禁止再打开已被占用的地址</b>，也不要用 <span class="mono">file://</span> 打开含 ES Module 的 index.html。推荐命令已避开 8080/5173 等常见占用位。</p>
+    <div id="portScan" class="kv muted">打开任务后自动扫描…</div>
+    <div class="grid" style="margin-top:8px">
+      <div>
+        <label style="font-weight:400">A 侧推荐启动（已避开占用端口）</label>
+        <pre class="mono" id="portCmdA" style="white-space:pre-wrap;background:#f8fafc;border:1px solid #e2e8f0;padding:8px;border-radius:6px;min-height:2.6em;margin:0"></pre>
+        <div class="btns">
+          <button class="ghost" type="button" onclick="copyPortCmd('A')">复制 A 命令</button>
+          <button class="sec" type="button" onclick="previewStart('A')">A 空闲端口预览</button>
+          <button class="ghost" type="button" onclick="openWorkspace('A')">打开 A 工作区</button>
+          <button type="button" onclick="openShell('A')">A 打开 PowerShell</button>
+        </div>
+      </div>
+      <div>
+        <label style="font-weight:400">B 侧推荐启动（已避开占用端口）</label>
+        <pre class="mono" id="portCmdB" style="white-space:pre-wrap;background:#f8fafc;border:1px solid #e2e8f0;padding:8px;border-radius:6px;min-height:2.6em;margin:0"></pre>
+        <div class="btns">
+          <button class="ghost" type="button" onclick="copyPortCmd('B')">复制 B 命令</button>
+          <button class="sec" type="button" onclick="previewStart('B')">B 空闲端口预览</button>
+          <button class="ghost" type="button" onclick="openWorkspace('B')">打开 B 工作区</button>
+          <button type="button" onclick="openShell('B')">B 打开 PowerShell</button>
+        </div>
+      </div>
+    </div>
+    <div class="btns">
+      <button class="ghost" type="button" onclick="portScan()">重新扫描端口</button>
+      <input id="probeUrl" placeholder="http://127.0.0.1:8080/" style="max-width:280px;width:auto;flex:1">
+      <button class="ghost" type="button" onclick="portProbe()">探测该地址是不是产物</button>
+      <button class="ghost" type="button" onclick="previewStop()">停止预览并清理 8080 残留</button>
+    </div>
+    <div id="portProbeOut" class="kv" style="margin-top:6px"></div>
   </div>
 
   <div class="card"><h3 style="margin-top:0">完整度检查 ${c.ready?'<span class="ok">✓ 可导出</span>':`（阻塞 ${c.blocking_count} / 提醒 ${c.warning_count}）`}</h3>
@@ -296,48 +461,147 @@ function renderDetail(id){SEL=id;const j=JOBS.find(x=>x.id===id);if(!j)return;
     <button class="ghost" onclick="refreshDetail(true)" style="margin-top:8px">在线核验链接可访问性（较慢）</button>
   </div>
 
-  <div class="card"><h3 style="margin-top:0">④ GSB 人工判断（严禁 AI 代写）</h3>
+  <details class="card" id="promptCard" open style="margin-bottom:12px">
+    <summary style="cursor:pointer;font-weight:700;user-select:none">📝 User Prompt 完整原文（A/B 共用）<span class="muted" style="font-weight:400"> · 写 GSB 时对照题目要求，点击折叠</span></summary>
+    <pre style="white-space:pre-wrap;word-break:break-word;margin:10px 2px 2px;max-height:240px;overflow:auto;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:10px 12px;font:12.5px/1.7 Consolas,'Microsoft YaHei',monospace;color:#334155">${esc(j.prompt||"(无提示词)")}</pre>
+  </details>
+
+  <div class="card"><h3 style="margin-top:0">④ GSB 人工判断（严禁 AI 代写）
+    ${j.review.locked_at?'<span class="tag" style="background:#fef3c7">🔒 已锁定评审</span>':""}</h3>
+    ${j.review.locked_at?`<p class="kv" style="color:#b45309">本任务已锁定：后端拒绝任何重跑/中止/重新准备/重新采集，确保证据在人工判断后不再变化。
+    锁定时间 ${esc(j.review.locked_at)}${j.review.ai_confirmed_at?" · 未用 AI 确认于 "+esc(j.review.ai_confirmed_at):""}。</p>`:""}
     <div class="grid">
-      <label>有效性<select id="r_validity"><option value="">请选择</option>${__VALIDITY__.map(x=>`<option ${x===j.review.validity?"selected":""}>${x}</option>`).join("")}</select></label>
-      <label>结论<select id="r_conclusion"><option value="">请选择</option>${__CONCLUSIONS__.map(x=>`<option ${x===j.review.conclusion?"selected":""}>${x}</option>`).join("")}</select></label>
+      <label>有效性<select id="r_validity" ${j.review.locked_at?"disabled":""}><option value="">请选择</option>${__VALIDITY__.map(x=>`<option ${x===j.review.validity?"selected":""}>${x}</option>`).join("")}</select></label>
+      <label>结论<select id="r_conclusion" ${j.review.locked_at?"disabled":""}><option value="">请选择</option>${__CONCLUSIONS__.map(x=>`<option ${x===j.review.conclusion?"selected":""}>${x}</option>`).join("")}</select></label>
     </div>
-    <label>GSB 理由（A、B 分别说明；Same 至少 80 字，其余 30 字以上；作废时可简述原因）<textarea id="r_reason" style="min-height:140px">${esc(j.review.reason||"")}</textarea></label>
-    <div class="btns"><button onclick="saveReview()">保存 GSB</button>
-    <button class="sec" onclick="exportRow()" ${c.ready?"":"disabled"}>⑤ 生成 TSV（全部绿灯后可用）</button></div>
+    <label>GSB 理由（A、B 分别说明；Same 至少 80 字，其余 30 字以上；作废时可简述原因）<textarea id="r_reason" ${j.review.locked_at?"disabled":""} style="min-height:140px">${esc(j.review.reason||"")}</textarea></label>
+    <p class="kv">交付完整性：分别评价两次 rollout 的产物质量和缺陷，也可从结果看题目难度。请写出具体不足；与 GSB 理由重复可以。旧任务可留空。</p>
+    <div class="grid">
+      ${["A","B"].map(s=>{const p=s.toLowerCase();return `<div>
+        <label>${s} - 交付完整性（1-5）<select id="r_${p}_delivery_score" ${j.review.locked_at?"disabled":""}><option value="">请选择</option>${[1,2,3,4,5].map(n=>`<option value="${n}" ${String(j.review[p+"_delivery_score"]||"")===String(n)?"selected":""}>${n}</option>`).join("")}</select></label>
+        <label>${s} - 交付完整性描述<textarea id="r_${p}_delivery_description" ${j.review.locked_at?"disabled":""} placeholder="说明产物质量、具体缺陷及题目难度体现">${esc(j.review[p+"_delivery_description"]||"")}</textarea></label>
+      </div>`}).join("")}
+    </div>
+    <label style="font-weight:400;display:flex;gap:8px;align-items:flex-start">
+      <input type="checkbox" id="r_aic" style="width:auto;margin-top:3px" ${j.review.ai_confirmed?"checked":""} ${j.review.locked_at?"disabled":""}>
+      <span>我确认：以上结论与理由由我本人基于真实运行/代码/录屏独立判断完成，<b>未使用任何 AI（Claude/ChatGPT/Codex 等）分析轨迹、产物或代写理由</b>。</span>
+    </label>
+    <div class="btns">
+      ${j.review.locked_at
+        ? '<button class="ghost" onclick="unlockReview()">🔓 解锁（确认需要修改证据/重跑时）</button>'
+        : '<button class="sec" onclick="saveReview(true)">保存 GSB 并锁定评审</button><button class="ghost" onclick="saveReview(false)">仅保存（不锁定）</button>'}
+      <button class="sec" onclick="exportRow()" ${c.ready?"":"disabled"}>⑤ ${j.review.locked_at?"重新生成 TSV（已标注）":"生成 TSV 并标记已标注"}（阻塞项通过后可用）</button>
+    </div>
     <div id="tsvBox" style="display:none;margin-top:10px">
       <pre class="log" id="tsvPre"></pre>
       <div class="btns"><button onclick="copyTsv()">复制 TSV（粘贴到飞书表格）</button>
       <button class="ghost" onclick="downloadTsv()">下载 .tsv 文件</button></div>
     </div>
   </div>`;
-  recRefresh("A");recRefresh("B");
-  D.scrollIntoView({behavior:"smooth"});
+  loadRecWindows();
+  if(!wasSame){recRefresh("A");recRefresh("B");portScan()}
+  else{["A","B"].forEach(s=>{if(recActive[s])recRefresh(s)});restoreDetailDraft();if(lastPortScan)renderPortScan(lastPortScan)}
+  if(!isPoll&&scroll!==false)D.scrollIntoView({behavior:"smooth"});
 }
-function sideHtml(j,s){const x=j.sides[s];const run=x.status==="running";
-  return `<div class="sidebox"><h3>${s} 侧 ${sideStatus(x.status)}</h3>
+function sideHtml(j,s){const x=j.sides[s];const run=sideBusy(x);
+  const locked=!!(j.review&&j.review.locked_at);
+  return `<div class="sidebox"><h3>${s} 侧 ${sideStatus(x.status, x.live)}</h3>
   <div class="kv">工作区：${esc(x.workspace||"未准备")}<br>分支：${esc(x.branch)}<br>
   会话：${esc(x.session_id||"-")}<br>
   产物：${x.head_url?`<a href="${esc(x.head_url)}" target="_blank" class="mono">${esc(x.head_sha.slice(0,12))}</a>${x.pushed?" ✓push":" ✗未push"}`:"-"}<br>
   轨迹：${x.trace_url?`<a href="${esc(x.trace_url)}" target="_blank">链接</a>`:(x.jsonl_local?esc(x.jsonl_local.split("\\").pop()):"-")}<br>
   录屏：${x.video_url?`<a href="${esc(x.video_url)}" target="_blank">链接</a>`:(x.video_local?esc(x.video_local.split("\\").pop()):"缺失")}<br>
+  ${(x.attempts&&x.attempts.length)?`尝试：${x.attempts.length} 次（证据目录 attempts/ 已逐次留存）<span title="${esc((x.attempts||[]).map(a=>"#"+a.attempt+" "+a.status+(a.failure?"："+a.failure:"")).join("\n"))}">ⓘ</span><br>`:""}
   ${x.error?`<span class="bad">${esc(x.error)}</span>`:""}</div>
-  <div class="btns"><button class="ghost" ${run?"disabled":""} title="${run?"运行中不能重跑，请先中止":""}" onclick="sideAct('retry','${s}')">重跑该侧</button>
+  <div class="btns"><button class="ghost" ${run||locked?"disabled":""} title="${locked?"评审已锁定，请先在 GSB 区解锁":run?"运行中不能重跑，请先中止":""}" onclick="sideAct('retry','${s}')">重跑该侧</button>
   <button class="ghost" ${run?"":"disabled"} onclick="sideAct('abort','${s}')">中止</button>
   <button class="ghost" onclick="openLog('${s}')">运行日志</button>
-  <button class="ghost" onclick="followSide('${s}')">📡 实时跟随</button></div></div>`}
+  <button class="ghost" onclick="followSide('${s}')">📡 实时跟随</button>
+  <button class="ghost" onclick="openShell('${s}')">PowerShell</button></div></div>`}
 function checksHtml(items){if(!items||!items.length)return '<span class="muted">点「刷新检查」</span>';
   const groups={};items.forEach(i=>{(groups[i.group]=groups[i.group]||[]).push(i)});
   return Object.entries(groups).map(([g,xs])=>`<div style="margin:6px 0"><b>${esc(g)}</b><br>${xs.map(x=>
    `<span title="${esc(x.detail)}"><span class="dot ${x.ok?"g":x.blocking?"r":"y"}"></span><span class="${x.ok?"ok":x.blocking?"bad":"warn"}">${esc(x.label)}</span></span>`).join("　")}</div>`).join("")}
 function closeDetail(){$("detail").style.display="none";SEL=null}
+async function openJob(id){
+  SEL=id;
+  const j=JOBS.find(x=>x.id===id);
+  const slot=CHECKS[id];
+  const fresh=j&&(j.check||(slot&&slot.fp===j.check_fp));
+  if(fresh){renderDetail(id);return}
+  await refreshDetail();
+}
+async function refreshDetail(online){
+  const id=SEL;if(!id)return;
+  const j=await api("/api/job",{id:id,online:!!online});
+  if(SEL!==id)return;
+  if(j.check)CHECKS[j.id]={check:j.check,fp:j.check_fp};
+  const f=JOBS.findIndex(x=>x.id===id);
+  if(f>=0)JOBS[f]=Object.assign({},JOBS[f],j);
+  else JOBS.push(j);
+  renderRows();renderDetail(id,false)
+}
 async function act(a){const body={job:SEL,action:a,video_a:$("vA")? $("vA").value:"",video_b:$("vB")?$("vB").value:""};
-  await api("/api/job_action",body);if(a==="delete"){closeDetail();await loadJobs();return}await refreshDetail()}
-async function deleteJob(){if(!confirm("确定删除该任务？将清理 A/B 工作区、证据文件和任务记录（已 push 的远端分支保留），不可恢复。"))return;await act("delete");toast("任务已删除")}
+  await api("/api/job_action",body);if(a==="delete"){delete CHECKS[SEL];closeDetail();await loadJobs();return}
+  if(a==="set_videos")vDirty.A=vDirty.B=false; // paths are now the persisted server values
+  await refreshDetail()}
+function deleteJob(){
+  const j=JOBS.find(x=>x.id===SEL);if(!j)return;
+  const repo=j.github_repo||"",created=j.github_created===true;
+  const pushed=["A","B"].some(s=>j.sides[s]&&j.sides[s].pushed);
+  $("delWarn").innerHTML=`将清理本地 A/B 工作区、证据文件和任务记录，<b>不可恢复</b>。`
+    +(repo?`<br>关联仓库：<span class="mono">${esc(repo)}</span>${created?"（交付台自动创建）":""}`:"<br>该任务未关联 GitHub 仓库。");
+  const opts=[["keep","仅删除本地（远端 GitHub 内容保留）"]];
+  if(repo&&pushed)opts.push(["branches","同时删除远端 A/B 分支（仓库保留）"]);
+  if(repo&&created)opts.push(["repo",`同时删除整个 GitHub 仓库（含全部分支与本地基线文件夹）`]);
+  $("delOpts").innerHTML=opts.map(([v,t],i)=>
+    `<label style="font-weight:400;display:block;margin:6px 0"><input type="radio" name="delRemote" value="${v}" ${i===0?"checked":""} style="width:auto;margin-right:6px">${esc(t)}</label>`).join("");
+  $("delModal").style.display="block";
+}
+async function doDelete(){
+  const v=(document.querySelector('input[name="delRemote"]:checked')||{}).value||"keep";
+  $("delModal").style.display="none";
+  const id=SEL;
+  const x=await api("/api/job_action",{job:id,action:"delete",remote:v});
+  delete CHECKS[id];
+  closeDetail();await loadJobs();
+  toast("任务已删除"+(x.repo_deleted?`，远端仓库 ${x.repo_deleted} 已删除`:x.branches_deleted?`，远端分支 ${x.branches_deleted.join("、")} 已删除`:""));
+}
 async function sideAct(a,s){await api("/api/side_action",{job:SEL,side:s,action:a});await refreshDetail()}
-async function refreshDetail(online){const j=await api("/api/job",{id:SEL,online:!!online});const f=JOBS.findIndex(x=>x.id===SEL);if(f>=0)JOBS[f]=j;renderRows();renderDetail(SEL)}
-async function saveReview(){await api("/api/review",{job:SEL,validity:$("r_validity").value,conclusion:$("r_conclusion").value,reason:$("r_reason").value});toast("GSB 已保存");refreshDetail()}
-async function exportRow(){const x=await api("/api/export",{job:SEL});$("tsvBox").style.display="block";$("tsvPre").textContent=x.tsv;window.__tsv=x.tsv}
-function copyTsv(){navigator.clipboard.writeText(window.__tsv||"");toast("已复制，去飞书表格粘贴（整行）")}
+async function saveReview(lock){
+  const aic=$("r_aic");
+  if(lock && !aic.checked){toast("请先勾选「未使用任何 AI」确认框再锁定",true);return}
+  await api("/api/review",{job:SEL,validity:$("r_validity").value,conclusion:$("r_conclusion").value,
+    reason:$("r_reason").value,...deliveryFields(),ai_confirmed:aic.checked,lock:!!lock});
+  toast(lock?"GSB 已保存并锁定（重跑/改证据已被后端拒绝）":"GSB 已保存");refreshDetail()
+}
+async function unlockReview(){
+  if(!confirm("解锁后将允许重新准备/重跑，可能改变证据。确定要解锁吗？"))return;
+  await api("/api/review",{job:SEL,unlock:true});toast("已解锁，可修改证据");refreshDetail()
+}
+async function exportRow(){
+  const aic=$("r_aic");
+  const cur=JOBS.find(x=>x.id===SEL);
+  const locked=!!(cur&&cur.review&&cur.review.locked_at);
+  // Generating the TSV is the "submit" action: persist + lock in one go so the
+  // list flips to 已标注 and re-runs/evidence edits are refused until unlock.
+  if(!locked){
+    if(!aic||!aic.checked){toast("请先勾选底部「未使用任何 AI」确认框，再生成 TSV（会同时锁定评审）",true);return}
+    await api("/api/review",{job:SEL,validity:$("r_validity").value,conclusion:$("r_conclusion").value,
+      reason:$("r_reason").value,...deliveryFields(),ai_confirmed:true,lock:true});
+  }
+  const x=await api("/api/export",{job:SEL});
+  $("tsvBox").style.display="block";$("tsvPre").textContent=x.tsv;window.__tsv=x.tsv;
+  await refreshDetail();
+  toast(locked?"已生成 TSV":"已生成 TSV，评审已锁定 → 列表显示「已标注」；需修改请点详情里的🔓解锁");
+}
+function deliveryFields(){return {
+  a_delivery_score:$("r_a_delivery_score").value,
+  a_delivery_description:$("r_a_delivery_description").value,
+  b_delivery_score:$("r_b_delivery_score").value,
+  b_delivery_description:$("r_b_delivery_description").value,
+}}
+function copyTsv(){navigator.clipboard.writeText(window.__tsv||"");toast("已复制一行数据（无表头），去飞书表格整行粘贴")}
 function downloadTsv(){const b=new Blob([window.__tsv||""],{type:"text/tab-separated-values"});const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download=SEL+".tsv";a.click()}
 async function openLog(s){const x=await api("/api/log",{job:SEL,side:s});const w=window.open("","_blank");w.document.write(`<pre style="font:12px Consolas;white-space:pre-wrap">${esc(x.log||"(空)")}</pre>`)}
 
@@ -356,7 +620,7 @@ async function tickFollow(){
   const j=await api("/api/job",{id:SEL}).catch(()=>null);
   for(const s of ["A","B"]){
     if(followOnly&&s!==followOnly)continue;
-    if(j&&j.sides&&j.sides[s])$("followState"+s).textContent="· "+sideStatus(j.sides[s].status);
+    if(j&&j.sides&&j.sides[s])$("followState"+s).innerHTML="· "+sideStatus(j.sides[s].status,j.sides[s].live);
     let x;try{x=await fetch("/api/log_tail",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({job:SEL,side:s,offset:followOff[s]})}).then(r=>r.json())}catch(e){continue}
     if(typeof x.offset!=="number")continue;
     if(x.offset<followOff[s]){$("followLog"+s).textContent="";followOff[s]=0} // rotated
@@ -366,29 +630,236 @@ async function tickFollow(){
 }
 function clearFollow(){["A","B"].forEach(s=>{followOff[s]=0;$("followLog"+s).textContent=""})}
 function closeFollow(){clearInterval(followTimer);followTimer=null;followOnly=null;$("follow").style.display="none";["A","B"].forEach(s=>{const c=$("followLog"+s).closest("div");c.style.display="";c.style.gridColumn=""})}
-async function pickVideo(s){const x=await api("/api/pick_file",{side:s});if(x.path){$("v"+s).value=x.path}}
+async function pickVideo(s){const x=await api("/api/pick_file",{side:s});if(x.path){$("v"+s).value=x.path;vDirty[s]=true}}
 
-let recTimers={};
-async function recStart(s){await api("/api/rec_start",{job:SEL,side:s});toast(s+" 侧开始录屏——切到产物窗口，从干净状态展示真实运行");recRefresh(s)}
-async function recStop(s){await api("/api/rec_stop",{job:SEL,side:s});recRefresh(s);await refreshDetail();toast(s+" 侧录屏已保存")}
+// ---- preserve in-progress GSB draft / TSV box across polling re-renders ----
+let detailDraft=null;
+// vDirty marks a video path input the operator manually edited but has not
+// persisted yet. Server-written paths (recStop/set_videos) must NOT be reverted
+// by a draft restore, so only a dirty input is carried across re-renders.
+const vDirty={A:false,B:false};
+function captureDetailDraft(){
+  const reason=$("r_reason");
+  const tsv=$("tsvBox");
+  const pc=$("promptCard");
+  const pp=pc?pc.querySelector("pre"):null;
+  let ae=null;
+  if(document.activeElement&&["r_validity","r_conclusion","r_reason","r_a_delivery_score","r_a_delivery_description","r_b_delivery_score","r_b_delivery_description","r_aic","vA","vB"].includes(document.activeElement.id))
+    ae={id:document.activeElement.id,start:null,end:null};
+  if(ae&&["r_reason","r_a_delivery_description","r_b_delivery_description"].includes(ae.id)){const field=$(ae.id);ae.start=field.selectionStart;ae.end=field.selectionEnd}
+  detailDraft={
+    validity:$("r_validity")?$("r_validity").value:"",
+    conclusion:$("r_conclusion")?$("r_conclusion").value:"",
+    reason:reason?reason.value:"",
+    ...deliveryFields(),
+    aic:$("r_aic")?$("r_aic").checked:false,
+    vA:$("vA")?$("vA").value:"",
+    vB:$("vB")?$("vB").value:"",
+    vADirty:vDirty.A,
+    vBDirty:vDirty.B,
+    tsvShown:tsv?tsv.style.display==="block":false,
+    tsv:window.__tsv||"",
+    promptOpen:pc?pc.open:true,
+    promptScroll:pp?pp.scrollTop:0,
+    focus:ae,
+  };
+}
+function restoreDetailDraft(){
+  if(!detailDraft)return;const d=detailDraft;
+  const reason=$("r_reason");
+  // Only restore when the draft differs from the last SAVED server state, i.e.
+  // the operator has unsaved edits. Never clobber a freshly saved review.
+  const cur=JOBS.find(x=>x.id===SEL);
+  const saved=cur?cur.review:{};
+  if(reason&&d.reason!==(saved.reason||"")){reason.value=d.reason}
+  for(const key of ["a_delivery_score","a_delivery_description","b_delivery_score","b_delivery_description"]){
+    const field=$("r_"+key);if(field&&d[key]!==String(saved[key]||""))field.value=d[key];
+  }
+  const v=$("r_validity");if(v&&d.validity&&d.validity!==(saved.validity||""))v.value=d.validity;
+  const c=$("r_conclusion");if(c&&d.conclusion&&d.conclusion!==(saved.conclusion||""))c.value=d.conclusion;
+  const a=$("r_aic");if(a&&d.aic&&d.aic!==!!saved.ai_confirmed)a.checked=d.aic;
+  const va=$("vA");if(va&&d.vADirty)va.value=d.vA;
+  const vb=$("vB");if(vb&&d.vBDirty)vb.value=d.vB;
+  vDirty.A=!!d.vADirty;vDirty.B=!!d.vBDirty;
+  if(d.tsvShown){const t=$("tsvBox");if(t){t.style.display="block";const p=$("tsvPre");if(p)p.textContent=d.tsv;window.__tsv=d.tsv}}
+  const pc=$("promptCard");
+  if(pc){pc.open=d.promptOpen!==false;const pp=pc.querySelector("pre");if(pp)pp.scrollTop=d.promptScroll||0}
+  if(d.focus){const f=$(d.focus.id);if(f&&!f.disabled){f.focus();
+    if(d.focus.start!=null&&f.setSelectionRange){try{f.setSelectionRange(d.focus.start,d.focus.end)}catch(e){}}
+  }}
+  detailDraft=null;
+}
+function recSavedHtml(j,s){const x=j.sides[s];
+  if(x.video_url)return `已上传：<a href="${esc(x.video_url)}" target="_blank">${esc((x.video_local||x.video_url).split("\\").pop().split("/").pop())}</a>`;
+  if(x.video_local)return `✓ 已保存<br><span class="muted">${esc(x.video_local)}</span>`;
+  return "未开始";
+}
+
+let lastPortScan=null;
+function renderPortScan(x){
+  lastPortScan=x; if(!x)return;
+  const el=$("portScan"); if(!el)return;
+  const warns=(x.warnings||[]).map(w=>`<div class="bad" style="margin:3px 0">⚠ ${esc(w.message)}</div>`).join("");
+  const occ=(x.listeners||[]).map(l=>`${l.addr||"127.0.0.1"}:${l.port} ${l.name||""} (${l.class||"?"})`).join(" · ");
+  el.innerHTML=(warns||'<span class="ok">✓ 常见开发端口没有发现 Steam/CEF 占用</span>')
+    +(occ?`<div class="muted" style="margin-top:4px">当前监听：${esc(occ)}</div>`:"");
+  ["A","B"].forEach(s=>{
+    const box=$("portCmd"+s); if(!box)return;
+    const side=(x.sides||{})[s]||{};
+    const cmd=(side.rewritten_commands||[])[0]||"";
+    const notes=(side.notes||[]).join("\n");
+    const prev=side.preview&&side.preview.running?("预览已开 "+side.preview.url+"\n"):"";
+    box.textContent=prev+(cmd?(cmd+"\n打开本题 "+(side.open_url||"")):"（该侧工作区尚无 README / index.html 启动提示）")
+      +(notes?"\n"+notes:"");
+  });
+}
+async function portScan(){
+  if(!SEL)return;
+  const el=$("portScan"); if(el)el.textContent="扫描中…";
+  try{renderPortScan(await api("/api/ports_scan",{job:SEL}))}
+  catch(e){if(el)el.innerHTML='<span class="bad">扫描失败</span>'}
+}
+async function copyPortCmd(s){
+  const side=(lastPortScan&&lastPortScan.sides||{})[s]||{};
+  const cmd=(side.rewritten_commands||[])[0]||"";
+  if(!cmd){toast("没有可复制的启动命令",true);return}
+  try{await navigator.clipboard.writeText(cmd);toast("已复制（空闲端口 "+(side.free_port||"")+"）："+cmd)}
+  catch(e){toast("复制失败，请手动选中命令",true)}
+}
+async function portProbe(){
+  const url=(($("probeUrl")||{}).value||"http://127.0.0.1:8080/").trim();
+  const out=$("portProbeOut"); if(out)out.textContent="探测中…";
+  try{
+    const x=await api("/api/ports_probe",{url});
+    const kind=x.kind==="cef_debugger"?"bad":(x.ok?"ok":"warn");
+    const label={cef_debugger:"这是 CEF/Steam 调试页，不是本题产物",product:"看起来是普通网页（请再核对是不是本题 UI）",
+      empty:"页面为空",unreachable:"连不上（可能没启动，或端口不对）",unknown:"无法判断"}[x.kind]||x.kind;
+    if(out)out.innerHTML=`<span class="${kind}">${esc(label)}</span> · HTTP ${esc(x.status||"-")} · 标题 ${esc(x.title||"-")}<div class="muted">${esc(x.snippet||x.error||"")}</div>`;
+    if(x.kind==="cef_debugger")toast("探测结果：Inspectable WebContents / Steam CEF，禁止当作产物",true);
+  }catch(e){if(out)out.innerHTML='<span class="bad">探测失败</span>'}
+}
+async function previewStart(s){
+  const x=await api("/api/preview_start",{job:SEL,side:s});
+  const port=x.port||0;
+  if([8080,5173,3000,8000].includes(port)){
+    toast(s+" 侧预览落到了常见占用端口 :"+port+"，已拒绝打开。请点「停止全部预览并清理残留」后再试",true);
+    portScan();portHubRefresh();return;
+  }
+  toast(s+" 侧已在本题空闲端口启动预览："+x.url+"（已关掉其他任务的预览）");
+  if(x.url)window.open(x.url,"_blank");
+  portScan();portHubRefresh();
+}
+async function previewStop(){
+  await portsReapAll();
+  portScan();
+}
+async function portHubRefresh(){
+  const el=$("portHubBody"); if(!el)return;
+  try{
+    const x=await api("/api/ports_overview",{});
+    const prev=(x.previews||[]).map(p=>`预览 ${esc(p.job_name||p.job)} ${esc(p.side)} → <a href="${esc(p.url)}" target="_blank">${esc(p.url)}</a> <span class="muted">${esc(p.workspace||"")}</span>`);
+    const left=(x.leftovers||[]).map(l=>{
+      const tag=l.killable?"残留可清":(l.class==="foreign"?"勿动（Steam/系统）":"占用");
+      return `${esc(l.name||"")} :${l.port} pid ${l.pid} · ${tag}`;
+    });
+    if(!prev.length&&!left.length){
+      el.innerHTML='<span class="ok">✓ 没有交付台预览，常见开发端口上也没有可清的 python/node 残留</span>';
+      return;
+    }
+    el.innerHTML=(prev.length?`<div>${prev.join("<br>")}</div>`:"")
+      +(left.length?`<div class="warn" style="margin-top:6px">⚠ ${left.join("<br>⚠ ")}</div>`:"");
+  }catch(e){el.innerHTML='<span class="bad">端口总览扫描失败</span>'}
+}
+async function portsReapAll(){
+  const x=await api("/api/ports_reap",{});
+  const n=(x.killed||[]).length;
+  toast(n?("已停全部预览并结束残留："+(x.killed||[]).map(k=>k.name+" :"+k.port).join("、")):"已停止全部任务的预览（8080 上没有可杀的外部 python/node）");
+  portHubRefresh();
+}
+async function openWorkspace(s){
+  await api("/api/open_workspace",{job:SEL,side:s});
+  toast("已打开 "+s+" 侧工作区文件夹");
+}
+async function openShell(s){
+  await api("/api/open_shell",{job:SEL,side:s});
+  toast("已打开 "+s+" 侧 PowerShell（工作目录=该侧工作区）");
+}
+
+let recTimers={}, recActive={A:false,B:false}, recPrimed={A:false,B:false};
+let recWindows=[], recWindowsLoaded=false; // cached enumerator window titles; survive re-renders
+const recWinSel={A:"",B:""}; // last chosen window per side, restored after re-render
+async function loadRecWindows(){
+  const fill=()=>{
+    ["A","B"].forEach(s=>{
+      const sel=$("recWin"+s);if(!sel)return;
+      (recWindows||[]).forEach(t=>{
+        if(Array.from(sel.options).some(o=>o.value===t))return;
+        const o=document.createElement("option");o.value=t;o.textContent="仅窗口："+t;sel.appendChild(o);
+      });
+      if(recWinSel[s])sel.value=recWinSel[s];
+    });
+  };
+  // Re-renders rebuild the <select> with only the built-in fullscreen option,
+  // so refill from the cache every time; fetch the enumerator list only once.
+  if(recWindowsLoaded){fill();return}
+  try{
+    const x=await api("/api/rec_windows",{});
+    recWindows=(x.windows||[]).map(w=>w.title);
+    recWindowsLoaded=true;
+    fill();
+  }catch(e){/* full screen still works */}
+}
+async function recStart(s){
+  const sel=$("recWin"+s), win=sel?sel.value:"";
+  try{
+    const scan=await api("/api/ports_scan",{job:SEL});
+    lastPortScan=scan;renderPortScan(scan);
+    if(scan.warnings&&scan.warnings.length){
+      toast("⚠ "+scan.warnings[0].message,true);
+    }
+  }catch(e){/* scan is advisory */}
+  await api("/api/rec_start",{job:SEL,side:s,window:win,max_seconds:SETTINGS.video_max_seconds||89,fps:SETTINGS.video_fps||15});
+  toast(s+" 侧开始录屏——从干净状态真实运行产物（终端+浏览器），结束立即停止");recRefresh(s)
+}
+async function recStop(s){await api("/api/rec_stop",{job:SEL,side:s});await refreshDetail();toast(s+" 侧录屏已保存")}
 async function recRefresh(s){
   clearInterval(recTimers[s]);
-  let x;try{const r=await fetch("/api/rec_status",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({job:SEL,side:s})});x=await r.json()}catch(e){return}
+  const jobId=SEL;
+  let x;try{const r=await fetch("/api/rec_status",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({job:jobId,side:s})});x=await r.json()}catch(e){return}
   const el=$("rec"+s);if(!el)return;
+  const wasRec=recActive[s];recActive[s]=!!x.recording;
   if(x.recording){
     const btn=$("recStop"+s);if(btn)btn.disabled=false;
-    el.innerHTML=`🔴 录制中 <b>${x.elapsed}s</b>（运行结束点「停止并保存」）`;
-    el.className="kv bad";
+    const cap=x.max_seconds?` / ${x.max_seconds}s 自动停`:"";
+    const html=`🔴 录制中 <b>${x.elapsed}s</b>${cap}${x.window?` · 窗口：${esc(x.window)}`:" · 全屏"}`;
+    if(!wasRec||el.innerHTML!==html){el.innerHTML=html;el.className="kv bad"}
     recTimers[s]=setInterval(()=>recRefresh(s),1000);
   }else{
     const btn=$("recStop"+s);if(btn)btn.disabled=true;
-    if(x.path){el.innerHTML=`✓ 已保存 ${x.duration?x.duration.toFixed(0)+"s":""} ${x.size?(x.size/1024/1024).toFixed(1)+"MB":""}<br><span class="muted">${esc(x.path)}</span>`;el.className="kv ok"}
-    else{el.textContent="未开始";el.className="kv muted"}
+    if(wasRec){
+      if(x.path){el.innerHTML=`✓ 已保存 ${x.duration?x.duration.toFixed(0)+"s":""} ${x.size?(x.size/1024/1024).toFixed(1)+"MB":""}<br><span class="muted">${esc(x.path)}</span>`;el.className="kv ok"}
+      else{
+        el.textContent="未开始";el.className="kv muted";
+        // Narrow window: ffmpeg exited but the watcher has not finalised the
+        // file yet. Re-check shortly after instead of staying on "未开始".
+        setTimeout(()=>{if(SEL===jobId&&!recActive[s]){clearInterval(recTimers[s]);recPrimed[s]=false;recRefresh(s)}},1200);
+      }
+      recPrimed[s]=true;
+    }else if(!recPrimed[s]){
+      // First status fetch for this detail view: enrich the server-persisted
+      // frame once with the file's size/duration. Afterwards never rewrite it
+      // (rewriting on every poll was the source of the visible flicker).
+      if(x.path){el.innerHTML=`✓ 已保存 ${x.duration?x.duration.toFixed(0)+"s":""} ${x.size?(x.size/1024/1024).toFixed(1)+"MB":""}<br><span class="muted">${esc(x.path)}</span>`;el.className="kv ok"}
+      recPrimed[s]=true;
+    }
   }
 }
 
 loadDefaults().then(loadJobs);
-pollTimer=setInterval(()=>{if(JOBS.some(j=>["running","ready"].includes(j.status)||Object.values(j.sides).some(x=>["running","preparing"].includes(x.status))))loadJobs()},5000);
+pollTimer=setInterval(()=>{
+  portHubRefresh();
+  if(JOBS.some(j=>["running","ready"].includes(j.status)||Object.values(j.sides).some(x=>x.live||["running","preparing"].includes(x.status))))loadJobs(true);
+},5000);
 </script></body></html>"""
 
 
@@ -419,13 +890,14 @@ a{color:var(--blue)}.hint{background:#f8fafc;border:1px solid var(--line);border
 
 <div class="card">
   <h2 style="margin-top:0">运行引擎</h2>
-  <p class="muted" style="margin:0 0 6px">上游（seed-code 网关）深度思考编码轮经常静默断流或中途 504；遇到断流会自动放弃残缺轮、重新复制干净基线副本并重试，直到拿到完整轮次。</p>
+  <p class="muted" style="margin:0 0 6px">上游（seed-code 网关）深度思考编码轮经常静默断流或中途 504；遇到断流会自动放弃残缺轮、重新复制干净基线副本并重试，直到拿到完整轮次。并行 pair 数保存后立刻扩容工人（不必重启）；8 路 pair = 最多 16 个 claude，受供应商 Key 并发上限约束。</p>
   <div class="grid3">
     <label>claude 命令<input id="s_claude"></label>
-    <label>最多并行 pair 数<input id="s_parallel" type="number" min="1" max="6"></label>
-    <label>单侧总超时（秒）<input id="s_timeout" type="number" min="300"></label>
-    <label>断流判定（秒无活动）<input id="s_stall" type="number" min="30"></label>
-    <label>单侧最多自动重试次数（最小 12）<input id="s_attempts" type="number" min="12" max="50"></label>
+    <label>最多并行 pair 数<input id="s_parallel" type="number" min="1" max="16"></label>
+    <label>单侧单次超时（秒）<input id="s_timeout" type="number" min="300" max="14400"></label>
+    <label>单侧总预算（秒，含重试）<input id="s_wall" type="number" min="60" max="28800"></label>
+    <label title="0=等 Claude 自己退出或报错再重试，不因思考静默杀进程">断流判定（秒无活动，0=等进程报错）<input id="s_stall" type="number" min="0"></label>
+    <label>单侧最多自动重试次数（最小 12）<input id="s_attempts" type="number" min="12" max="16"></label>
     <label>活动轮询间隔（秒）<input id="s_poll" type="number" min="5"></label>
     <label title="-p 非交互下 acceptEdits 会自动拒绝所有 Bash，模型会空转整轮；工作区是一次性副本，默认完全放行">
       运行权限模式
@@ -436,6 +908,9 @@ a{color:var(--blue)}.hint{background:#f8fafc;border:1px solid var(--line);border
         <option value="plan">plan（只读规划，不执行）</option>
       </select>
     </label>
+    <label title="真人运行产物的录屏上限；到点 ffmpeg 自动正常结束，几秒也可以">
+      录屏自动停止（秒，建议 60–89）<input id="s_vidmax" type="number" min="5" max="600"></label>
+    <label title="帧率越低文件越小；终端/网页演示 10–15 足够">录屏帧率 FPS<input id="s_vidfps" type="number" min="5" max="30"></label>
   </div>
 </div>
 
@@ -492,9 +967,11 @@ async function api(path,body){
 let SETTINGS={};
 async function load(){SETTINGS=await api("/api/settings_get");
   $("s_claude").value=SETTINGS.claude_command;$("s_parallel").value=SETTINGS.max_parallel_pairs;
-  $("s_timeout").value=SETTINGS.side_timeout_seconds;$("s_stall").value=SETTINGS.stall_seconds;
+  $("s_timeout").value=SETTINGS.side_timeout_seconds;$("s_wall").value=SETTINGS.side_wall_budget_seconds||14400;$("s_stall").value=SETTINGS.stall_seconds;
   $("s_attempts").value=Math.max(12,SETTINGS.side_max_attempts);$("s_poll").value=SETTINGS.activity_poll_seconds;
   $("s_perm").value=SETTINGS.permission_mode||"bypassPermissions";
+  $("s_vidmax").value=SETTINGS.video_max_seconds||89;
+  $("s_vidfps").value=SETTINGS.video_fps||15;
   $("s_endpoint").value=SETTINGS.oss_endpoint;$("s_region").value=SETTINGS.oss_region;
   $("s_bucket").value=SETTINGS.oss_bucket;$("s_pubbase").value=SETTINGS.oss_public_base||"";
   $("s_prefix").value=SETTINGS.oss_key_prefix;$("s_baseline").value=SETTINGS.default_baseline_repo||"";
@@ -507,16 +984,19 @@ async function load(){SETTINGS=await api("/api/settings_get");
     :`<span class="bad">未配置（endpoint/bucket 或密钥缺失）</span>`;
 }
 async function saveSettings(){const body={claude_command:$("s_claude").value,max_parallel_pairs:+$("s_parallel").value,
- side_timeout_seconds:+$("s_timeout").value,stall_seconds:+$("s_stall").value,
+ side_timeout_seconds:+$("s_timeout").value,side_wall_budget_seconds:+$("s_wall").value,stall_seconds:+$("s_stall").value,
  side_max_attempts:Math.max(12,+$("s_attempts").value),activity_poll_seconds:+$("s_poll").value,
  permission_mode:$("s_perm").value,
+ video_max_seconds:Math.max(5,+$("s_vidmax").value||89),video_fps:Math.max(5,+$("s_vidfps").value||15),
  oss_endpoint:$("s_endpoint").value,oss_region:$("s_region").value,
  oss_bucket:$("s_bucket").value,oss_public_base:$("s_pubbase").value,oss_key_prefix:$("s_prefix").value,
  default_baseline_repo:$("s_baseline").value,
  baseline_parent_dir:$("s_parent").value,github_owner:$("s_owner").value,
  github_private:$("s_private").value==="1",
  reviewer:$("s_reviewer").value};
- SETTINGS=await api("/api/settings_save",body);toast("设置已保存（新任务/下一次重试运行时生效）")}
+ SETTINGS=await api("/api/settings_save",body);
+ const n=SETTINGS.workers||SETTINGS.max_parallel_pairs||0;
+ toast("设置已保存：现在 "+n+" 路 pair 并行（最多 "+(2*n)+" 个 claude），排队中的任务会马上被新工人领走，不必重启")}
 async function ghStatus(){
   const el=$("ghStatus");if(!el)return;
   el.innerHTML='<span class="muted">检测 gh 登录状态…</span>';
@@ -535,11 +1015,66 @@ load();
 </script></body></html>"""
 
 
+# Browser refresh / overlapping 5s polls abort the previous fetch. Windows
+# surfaces that as WinError 10053/10054; it is not a desk crash.
+_CLIENT_GONE = (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, TimeoutError)
+_WIN_CLIENT_GONE = {10053, 10054}  # WSAECONNABORTED / WSAECONNRESET
+
+
+def _is_client_gone(exc: BaseException | None) -> bool:
+    if exc is None:
+        return False
+    if isinstance(exc, _CLIENT_GONE):
+        return True
+    winerr = getattr(exc, "winerror", None)
+    return winerr in _WIN_CLIENT_GONE
+
+
+def _side_workspace(job: dict, side: str) -> Path:
+    """Resolve the job's own A/B workspace. Never takes a client-supplied path."""
+    name = str(side or "").upper()
+    if name not in ("A", "B"):
+        raise RuntimeError("side 必须是 A 或 B")
+    wdir = (job.get("sides") or {}).get(name, {}).get("workspace") or ""
+    path = Path(wdir)
+    if not wdir or not path.is_dir():
+        raise RuntimeError(f"{name} 侧工作区不存在")
+    return path.resolve()
+
+
+def _powershell_exe() -> str:
+    import os
+    root = os.environ.get("SystemRoot") or os.environ.get("WINDIR") or r"C:\Windows"
+    bundled = Path(root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    return str(bundled) if bundled.is_file() else "powershell.exe"
+
+
+def _powershell_popen(wdir: Path, *, title: str = "") -> tuple[list[str], dict]:
+    """Visible PowerShell at *wdir* (works even when the desk is pythonw.exe)."""
+    ps_path = str(wdir).replace("'", "''")
+    ps_title = (title or "工作区").replace("'", "''")
+    args = [
+        _powershell_exe(), "-NoExit", "-NoLogo",
+        "-Command",
+        "try { $Host.UI.RawUI.WindowTitle = '%s' } catch {}; Set-Location -LiteralPath '%s'"
+        % (ps_title, ps_path),
+    ]
+    kwargs: dict[str, str | int] = {"cwd": str(wdir)}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+    return args, kwargs
+
+
 class _ExclusiveServer(ThreadingHTTPServer):
     # On Windows SO_REUSEADDR lets two processes bind the same port; refuse it so
     # a second desk fails loudly instead of silently double-running every job.
     allow_reuse_address = False
     daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        if _is_client_gone(sys.exc_info()[1]):
+            return
+        super().handle_error(request, client_address)
 
 
 class DeskServer:
@@ -547,9 +1082,14 @@ class DeskServer:
         self.store = store
         self.runner = PairRunner(store)
         self.recorder = Recorder(store)
+        self.previews = ports_mod.PreviewRegistry()
         self.port = port
         self._lock_fp = None
         self._gh_login_cache: tuple[str, float] | None = None
+        # Last computed completeness report per job. /api/jobs does not rerun
+        # the checklist (git ancestry, ffprobe); without this overlay a 5s poll
+        # replaces JOBS and the UI drops back to 「点刷新检查」.
+        self._checklist_cache: dict[str, dict] = {}
 
     def _gh_login(self, *, ttl_seconds: float = 60.0) -> str:
         """Cached gh login to avoid spawning `gh api user` on every keystroke probe."""
@@ -594,6 +1134,30 @@ class DeskServer:
         return oss_mod.config_from_mapping(settings, self.store.secrets_path)
 
     # ---------- actions ----------
+    REVIEW_LOCKED_MSG = "该任务已进入人工评审锁定状态（已确认未用 AI）。如需重跑/改证据，请先在 GSB 区「解锁」。"
+
+    def _ensure_review_unlocked(self, job_id: str) -> None:
+        if DeskStore.review_locked(self.store.get_job(job_id)):
+            raise RuntimeError(self.REVIEW_LOCKED_MSG)
+
+    def _ensure_not_archived(self, job_id: str) -> None:
+        if self.store.get_job(job_id).get("archived"):
+            raise RuntimeError("该任务已归档。请先在列表切换到「已归档」并点「恢复」，再执行此操作。")
+
+    def _set_archived(self, job_id: str, archived: bool) -> dict:
+        """Archive (hide) or restore a job. Running jobs cannot be archived."""
+        job = self.store.get_job(job_id)
+        if archived and any(self.runner.is_side_live(job_id, s) for s in ("A", "B")):
+            raise RuntimeError("任务仍在运行/采集中，请先结束或等待完成后再归档")
+        if archived:
+            # Belt-and-braces: never archive while a run is queued/in-flight,
+            # even if the live flag has not flipped yet.
+            for side in job.get("sides", {}).values():
+                if side.get("status") in ("running", "preparing", "collecting"):
+                    raise RuntimeError("任务仍在运行/准备/采集中，不能归档")
+        updated = self.store.set_archived(job_id, archived)
+        return {"archived": bool(updated.get("archived")), "job": updated["id"]}
+
     def job_create(self, body: dict, prepare: bool = True) -> dict:
         job = self.store.create_job(body)
         result: dict = {"job": job["id"], "prepared": [], "provisioned": None}
@@ -659,21 +1223,33 @@ class DeskServer:
     def job_action(self, body: dict) -> dict:
         job_id, action = body["job"], body["action"]
         if action == "prepare":
+            self._ensure_review_unlocked(job_id)
+            self._ensure_not_archived(job_id)
             return {"result": self.runner.prepare(job_id)}
         if action == "enqueue":
+            self._ensure_review_unlocked(job_id)
+            self._ensure_not_archived(job_id)
             job = self.store.get_job(job_id)
             if not job.get("baseline_sha"):
                 self.runner.prepare(job_id)
-            self.store.update_job(job_id, {"status": "ready", "error": ""})
             for side_name, side in self.store.get_job(job_id)["sides"].items():
-                if side["status"] == "failed":
-                    self.runner.retry_side(job_id, side_name)
+                if side["status"] == "failed" and not self.runner.is_side_running(job_id, side_name):
+                    # Recopy every failed side first. enqueue=True here would
+                    # launch the pair while the sibling is still dirty.
+                    self.runner.retry_side(job_id, side_name, enqueue=False)
             self.runner.enqueue(job_id)
+            self.runner._sync_job_status(job_id)
             return {"queued": True}
         if action == "collect":
+            self._ensure_review_unlocked(job_id)
+            self._ensure_not_archived(job_id)
             for side_name in ("A", "B"):
                 self._recollect_side(job_id, side_name)
             return {"collected": True}
+        if action == "archive":
+            return self._set_archived(job_id, True)
+        if action == "unarchive":
+            return self._set_archived(job_id, False)
         if action == "set_videos":
             for side_name, key in (("A", "video_a"), ("B", "video_b")):
                 val = (body.get(key) or "").strip()
@@ -692,12 +1268,22 @@ class DeskServer:
                 })
             return {"uploaded": True}
         if action == "delete":
+            remote = str(body.get("remote") or "keep")
+            if remote not in ("keep", "branches", "repo"):
+                raise RuntimeError(f"未知的 remote 参数 {remote}")
             for side_name in ("A", "B"):
                 try:
                     self.runner.abort_side(job_id, side_name)
                 except Exception:
                     pass
+                try:
+                    self.previews.stop_side(job_id, side_name)
+                except Exception:
+                    pass
             job = self.store.get_job(job_id)
+            # Remote cleanup runs BEFORE local state is removed: when it fails
+            # the job record stays, so the user can retry or pick 仅删除本地.
+            remote_result = self._delete_remote(job, remote) if remote != "keep" else {}
             for side_name in ("A", "B"):
                 wdir = job["sides"][side_name].get("workspace", "")
                 if wdir:
@@ -709,8 +1295,57 @@ class DeskServer:
             if ev_dir.exists():
                 ws.robust_rmtree(ev_dir)
             self.store.delete_job(job_id)
-            return {"deleted": True}
+            self._checklist_cache.pop(job_id, None)
+            if remote_result.get("baseline_dir"):
+                # The repo is gone remotely; drop the auto-provisioned local
+                # baseline folder too, unless another job still uses it.
+                baseline = remote_result["baseline_dir"]
+                still_used = any(
+                    j.get("baseline_repo") == baseline
+                    for j in self.store.list_jobs()
+                )
+                if not still_used and Path(baseline).is_dir():
+                    ws.robust_rmtree(baseline)
+            return {"deleted": True, **remote_result}
         raise RuntimeError(f"未知操作 {action}")
+
+    def _delete_remote(self, job: dict, mode: str) -> dict:
+        """Delete this job's GitHub artifacts (branches, or the whole repo).
+
+        Raises RuntimeError on any failure so the caller keeps local state.
+        """
+        repo_full = (job.get("github_repo") or "").strip()
+        if "/" not in repo_full:
+            raise RuntimeError(
+                "该任务没有记录 GitHub 仓库（可能是纯本地基线），没有可删的远端内容"
+            )
+        owner = repo_full.split("/", 1)[0]
+        login = self._gh_login()
+        if owner.lower() != login.lower():
+            raise RuntimeError(
+                f"仓库 {repo_full} 不属于当前 gh 登录账号 {login}，拒绝删除远端内容"
+            )
+        cli = ghutil.CliGh()
+        if mode == "repo":
+            if not job.get("github_created"):
+                raise RuntimeError(
+                    f"{repo_full} 不是交付台自动创建的仓库（可能是已有基线仓库），"
+                    "只允许删除 A/B 分支，不允许删除整个仓库"
+                )
+            cli.repo_delete(repo_full)
+            return {"repo_deleted": repo_full,
+                    "baseline_dir": (job.get("baseline_repo") or "").strip()}
+        branches = [
+            job["sides"][s].get("branch", "")
+            for s in ("A", "B")
+            if job["sides"][s].get("pushed") and job["sides"][s].get("branch")
+        ]
+        if not branches:
+            raise RuntimeError("该任务没有已 push 的远端分支，无需清理")
+        errors = cli.delete_remote_branches(repo_full, branches)
+        if errors:
+            raise RuntimeError("删除远端分支失败：" + "；".join(errors))
+        return {"branches_deleted": branches}
 
     def _recollect_side(self, job_id: str, side_name: str) -> None:
         import shutil
@@ -740,6 +1375,8 @@ class DeskServer:
     def side_action(self, body: dict) -> dict:
         job_id, side_name, action = body["job"], body["side"], body["action"]
         if action == "retry":
+            self._ensure_review_unlocked(job_id)
+            self._ensure_not_archived(job_id)
             self.runner.retry_side(job_id, side_name)
             return {"retry": True}
         if action == "abort":
@@ -747,10 +1384,219 @@ class DeskServer:
             return {"aborted": True}
         raise RuntimeError(f"未知操作 {action}")
 
+    def review_save(self, body: dict) -> dict:
+        """Persist the human GSB judgement.
+
+        Saving with ``lock=True`` + the no-AI attestation flips the pair into
+        the review-locked gate (run/retry/prepare refused); ``unlock=True``
+        deliberately releases it so evidence can be corrected.
+        """
+        from .desk_store import utc_now
+        job_id = body["job"]
+        patch = {k: body.get(k) for k in ("validity", "conclusion", "reason", "reviewer", "note")
+                 if k in body}
+        for side in ("a", "b"):
+            score_key = f"{side}_delivery_score"
+            description_key = f"{side}_delivery_description"
+            if score_key in body:
+                score = str(body[score_key]).strip()
+                if score and score not in {"1", "2", "3", "4", "5"}:
+                    raise RuntimeError(f"{side.upper()} 交付完整性只能填写 1-5")
+                patch[score_key] = score
+            if description_key in body:
+                patch[description_key] = str(body[description_key]).strip()
+        job = self.store.get_job(job_id)
+        review = job.get("review", {})
+        if body.get("unlock"):
+            patch.update({"ai_confirmed": False, "ai_confirmed_at": "", "locked_at": ""})
+        elif body.get("lock"):
+            if not body.get("ai_confirmed"):
+                raise RuntimeError("请先勾选「我确认未使用任何 AI 分析轨迹/产物」再锁定")
+            if not str(body.get("reason", "")).strip():
+                raise RuntimeError("请先填写 GSB 理由再锁定")
+            if job.get("delivery_quality_required") and body.get("validity", review.get("validity")) == "有效":
+                for side in ("a", "b"):
+                    score = patch.get(f"{side}_delivery_score", review.get(f"{side}_delivery_score", ""))
+                    description = patch.get(f"{side}_delivery_description", review.get(f"{side}_delivery_description", ""))
+                    if score not in {"1", "2", "3", "4", "5"} or not description:
+                        raise RuntimeError(f"请填写 {side.upper()} 交付完整性评分（1-5）和缺陷描述再锁定")
+            patch.update({"ai_confirmed": True,
+                          "ai_confirmed_at": review.get("ai_confirmed_at") or utc_now(),
+                          "locked_at": utc_now()})
+        return self.store.update_review(job_id, patch)
+
+    @staticmethod
+    def _checklist_fingerprint(job: dict) -> tuple:
+        """Evidence fields the completeness report depends on.
+
+        ``updated_at`` is second-resolution, so two writes in the same second
+        would look unchanged; fingerprint the actual overlay inputs instead.
+        """
+        a, b = job["sides"]["A"], job["sides"]["B"]
+        r = job.get("review") or {}
+        def side_key(s: dict) -> tuple:
+            return (s.get("status"), s.get("jsonl_local"), s.get("trace_url"),
+                    s.get("video_local"), s.get("video_url"), s.get("head_sha"),
+                    s.get("head_url"), bool(s.get("pushed")), s.get("session_id"))
+        return (side_key(a), side_key(b),
+                r.get("validity"), r.get("conclusion"), r.get("reason"),
+                r.get("a_delivery_score"), r.get("a_delivery_description"),
+                r.get("b_delivery_score"), r.get("b_delivery_description"),
+                r.get("locked_at"), job.get("prompt"), job.get("harness_version"),
+                job.get("baseline_sha"), job.get("baseline_url"),
+                bool(job.get("baseline_pushed")))
+
+    def public_job(self, job: dict) -> dict:
+        """API view: overlay live-process flags so the UI matches the runner."""
+        out = json.loads(json.dumps(job))
+        for name in ("A", "B"):
+            live = self.runner.is_side_live(out["id"], name)
+            out["sides"][name]["live"] = live
+        fp = self._checklist_fingerprint(job)
+        out["check_fp"] = repr(fp)
+        cached = self._checklist_cache.get(out["id"])
+        if cached and cached.get("_fp") == fp:
+            out["check"] = {k: v for k, v in cached.items() if k != "_fp"}
+        return out
+
     def job_view(self, job_id: str, online: bool = False) -> dict:
         job = self.store.get_job(job_id)
-        job["check"] = run_checklist(job, online=online)
-        return job
+        report = run_checklist(job, online=online)
+        self._checklist_cache[job_id] = {**report, "_fp": self._checklist_fingerprint(job)}
+        out = self.public_job(job)
+        out["check"] = report
+        return out
+
+    def _job_workspaces(self, job: dict) -> dict[str, str]:
+        return {s: (job["sides"][s].get("workspace") or "") for s in ("A", "B")}
+
+    def ports_scan(self, body: dict) -> dict:
+        job = self.store.get_job(body["job"])
+        # Previous pair's ExclusiveServer lives in this same python.exe
+        # (e.g. LP lab still on :8080). taskkill cannot reap our own pid.
+        dropped = self.previews.stop_others(job["id"])
+        extra_skip: set[int] = set()
+        owned_ports: set[int] = set()
+        for side in ("A", "B"):
+            st = self.previews.status(job["id"], side)
+            if st.get("running") and st.get("port"):
+                extra_skip.add(int(st["port"]))
+                owned_ports.add(int(st["port"]))
+        report = ports_mod.gsb_scan(
+            workspaces=self._job_workspaces(job), desk_port=self.port,
+            extra_skip=extra_skip, owned_ports=owned_ports)
+        if dropped:
+            report["dropped_previews"] = dropped
+        for side in ("A", "B"):
+            if side in report.get("sides", {}):
+                report["sides"][side]["preview"] = self.previews.status(job["id"], side)
+        return report
+
+    def ports_probe(self, body: dict) -> dict:
+        url = str(body.get("url") or "").strip()
+        ports_mod.assert_loopback_http_url(url)
+        return ports_mod.probe_http(url)
+
+    def preview_stop(self, body: dict) -> dict:
+        job_id = body.get("job")
+        side = str(body.get("side") or "").upper()
+        if job_id and side in ("A", "B"):
+            return self.previews.stop_side(job_id, side)
+        if job_id:
+            return {
+                "stopped": True,
+                "A": self.previews.stop_side(job_id, "A"),
+                "B": self.previews.stop_side(job_id, "B"),
+            }
+        self.previews.stop_all()
+        return {"stopped": True}
+
+    def preview_start(self, body: dict) -> dict:
+        job = self.store.get_job(body["job"])
+        side = str(body.get("side") or "").upper()
+        if side not in ("A", "B"):
+            raise RuntimeError("side 必须是 A 或 B")
+        wdir = job["sides"][side].get("workspace") or ""
+        if not wdir or not Path(wdir).is_dir():
+            raise RuntimeError(f"{side} 侧工作区不存在")
+        occupied = {int(r["port"]) for r in ports_mod.list_listeners() if r.get("port")}
+        # Never sit on 8080/5173: those are where Steam and leftover labs linger.
+        skip = {int(self.port)} | occupied | set(ports_mod.COMMON_DEV_PORTS)
+        return self.previews.start(
+            job["id"], side, wdir, preferred=None, skip=skip)
+
+    def ports_overview(self, body: dict | None = None) -> dict:
+        """Desk-wide listeners: in-process previews + leftover product servers."""
+        import os
+        jobs = {j["id"]: j for j in self.store.list_jobs()}
+        previews = []
+        preview_ports: set[int] = set()
+        for item in self.previews.list_all():
+            key = str(item.get("key") or "")
+            job_id, _, side = key.partition("/")
+            job = jobs.get(job_id) or {}
+            port = int(item.get("port") or 0)
+            if port:
+                preview_ports.add(port)
+            previews.append({
+                **item,
+                "job": job_id,
+                "side": side,
+                "job_name": job.get("name") or job_id,
+            })
+        leftovers = []
+        desk_pid = os.getpid()
+        for row in ports_mod.list_listeners():
+            port = int(row.get("port") or 0)
+            pid = int(row.get("pid") or 0)
+            if port == int(self.port) or port in preview_ports:
+                continue
+            if port not in ports_mod.COMMON_DEV_PORTS:
+                continue
+            name = row.get("name") or ""
+            kind = ports_mod.classify_process_name(name)
+            leftovers.append({
+                "addr": row.get("addr") or "127.0.0.1",
+                "port": port,
+                "pid": pid,
+                "name": name,
+                "class": kind,
+                "killable": kind == "product" and pid not in (0, desk_pid),
+                "url": f"http://127.0.0.1:{port}/",
+            })
+        return {
+            "desk_port": int(self.port),
+            "previews": previews,
+            "leftovers": leftovers,
+        }
+
+    def ports_reap(self, body: dict | None = None) -> dict:
+        import os
+        self.previews.stop_all()
+        return {"previews_stopped": True,
+                **ports_mod.reap_leftover_listeners(keep_pids={os.getpid()})}
+
+    def open_workspace(self, body: dict) -> dict:
+        import os
+        job = self.store.get_job(body["job"])
+        wdir = _side_workspace(job, str(body.get("side") or ""))
+        # Only the job's own workspace; never pass an arbitrary client path.
+        if sys.platform == "win32":
+            os.startfile(str(wdir))  # noqa: S606 — operator-triggered Explorer
+        else:
+            subprocess.Popen(["xdg-open", str(wdir)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return {"opened": str(wdir)}
+
+    def open_shell(self, body: dict) -> dict:
+        if sys.platform != "win32":
+            raise RuntimeError("打开 PowerShell 仅支持 Windows")
+        job = self.store.get_job(body["job"])
+        side = str(body.get("side") or "").upper()
+        wdir = _side_workspace(job, side)
+        title = f"ATK {side} · {job.get('name') or job.get('id') or ''}".strip(" ·")
+        args, kwargs = _powershell_popen(wdir, title=title)
+        subprocess.Popen(args, **kwargs)
+        return {"opened": str(wdir), "kind": "shell"}
 
     # ---------- http handler ----------
     def make_handler(self):
@@ -794,11 +1640,16 @@ class DeskServer:
 
             def _send(self, value, status=200):
                 data = json.dumps(value, ensure_ascii=False).encode("utf-8")
-                self.send_response(status)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
+                try:
+                    self.send_response(status)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                except Exception as exc:
+                    if _is_client_gone(exc):
+                        return
+                    raise
 
             def _body(self):
                 # A cross-origin "simple" POST can only send form/plain content
@@ -826,19 +1677,27 @@ class DeskServer:
                               .replace("__VALIDITY__", json.dumps(VALIDITY, ensure_ascii=False)) \
                               .replace("__REPRO__", json.dumps(REPRO_LEVELS, ensure_ascii=False))
                     raw = data.encode("utf-8")
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/html; charset=utf-8")
-                    self.send_header("Content-Length", str(len(raw)))
-                    self.end_headers()
-                    self.wfile.write(raw)
+                    try:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/html; charset=utf-8")
+                        self.send_header("Content-Length", str(len(raw)))
+                        self.end_headers()
+                        self.wfile.write(raw)
+                    except Exception as exc:
+                        if not _is_client_gone(exc):
+                            raise
                     return
                 if path == "/settings":
                     raw = SETTINGS_PAGE.encode("utf-8")
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/html; charset=utf-8")
-                    self.send_header("Content-Length", str(len(raw)))
-                    self.end_headers()
-                    self.wfile.write(raw)
+                    try:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/html; charset=utf-8")
+                        self.send_header("Content-Length", str(len(raw)))
+                        self.end_headers()
+                        self.wfile.write(raw)
+                    except Exception as exc:
+                        if not _is_client_gone(exc):
+                            raise
                     return
                 self._send({"error": "not found"}, 404)
 
@@ -855,6 +1714,8 @@ class DeskServer:
                 except FileNotFoundError as exc:
                     self._send({"ok": False, "error": str(exc)}, 404)
                 except Exception as exc:
+                    if _is_client_gone(exc):
+                        return
                     self._send({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, 400)
 
             def _route(self, path: str, body: dict):
@@ -863,7 +1724,9 @@ class DeskServer:
                     return {**s, "secret_path": str(server.store.secrets_path),
                             "oss": oss_mod.describe_config(server.oss_cfg())}
                 if path == "/api/settings_save":
-                    return server.store.save_settings(body)
+                    saved = dict(server.store.save_settings(body))
+                    saved["workers"] = server.runner.ensure_workers()
+                    return saved
                 if path == "/api/oss_test":
                     cfg = server.oss_cfg(body)
                     return oss_mod.connection_test(cfg) if cfg else {"ok": False, "error": "OSS 配置不完整"}
@@ -873,7 +1736,7 @@ class DeskServer:
                         return {"ok": False, "error": "OSS 配置不完整"}
                     return oss_mod.ensure_bucket(cfg)
                 if path == "/api/jobs":
-                    return {"jobs": server.store.list_jobs()}
+                    return {"jobs": [server.public_job(j) for j in server.store.list_jobs()]}
                 if path == "/api/repo_check":
                     return server.repo_check(body)
                 if path == "/api/gh_status":
@@ -889,7 +1752,7 @@ class DeskServer:
                 if path == "/api/side_action":
                     return server.side_action(body)
                 if path == "/api/review":
-                    return server.store.update_review(body["job"], body)
+                    return server.review_save(body)
                 if path == "/api/export":
                     job = server.store.get_job(body["job"])
                     out = server.store.evidence_dir(body["job"]) / "submission.tsv"
@@ -917,12 +1780,35 @@ class DeskServer:
                             "size": size, "mtime": p.stat().st_mtime}
                 if path == "/api/pick_file":
                     return server._pick_file(body.get("side", "A"))
+                if path == "/api/rec_windows":
+                    return {"windows": server.recorder.list_windows()}
                 if path == "/api/rec_start":
-                    return server.recorder.start(body["job"], body["side"])
+                    return server.recorder.start(
+                        body["job"], body["side"],
+                        window=body.get("window", ""),
+                        max_seconds=int(body.get("max_seconds") or 0),
+                        fps=int(body.get("fps") or 0),
+                    )
                 if path == "/api/rec_stop":
                     return server.recorder.stop(body["job"], body["side"])
                 if path == "/api/rec_status":
                     return server.recorder.status(body["job"], body["side"])
+                if path == "/api/ports_scan":
+                    return server.ports_scan(body)
+                if path == "/api/ports_probe":
+                    return server.ports_probe(body)
+                if path == "/api/preview_start":
+                    return server.preview_start(body)
+                if path == "/api/preview_stop":
+                    return server.preview_stop(body)
+                if path == "/api/ports_overview":
+                    return server.ports_overview(body)
+                if path == "/api/ports_reap":
+                    return server.ports_reap(body)
+                if path == "/api/open_workspace":
+                    return server.open_workspace(body)
+                if path == "/api/open_shell":
+                    return server.open_shell(body)
                 return {"ok": False, "error": f"unknown path {path}"}
 
         return Handler
@@ -975,8 +1861,10 @@ class DeskServer:
             "$f.Filter='Video (*.mp4)|*.mp4|All (*.*)|*.*';"
             "if($f.ShowDialog() -eq 'OK'){[Console]::OutputEncoding=[Text.Encoding]::UTF8;$f.FileName}"
         )
+        # Hidden console only — do not CREATE_NO_WINDOW, or OpenFileDialog
+        # may never appear (it needs a desktop window).
         p = subprocess.run(
-            ["powershell", "-NoProfile", "-STA", "-Command", ps],
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-STA", "-Command", ps],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300,
         )
         return {"path": p.stdout.strip()}
@@ -992,18 +1880,24 @@ class DeskServer:
         except OSError as exc:
             print(f"端口 {self.port} 已被占用，交付台可能已在运行：{exc}")
             return 2
+        # Accept HTTP before recover() recopies workspaces, otherwise the
+        # supervisor health check treats a listening-but-blocked worker as dead.
+        http_thread = threading.Thread(target=httpd.serve_forever, name="desk-http", daemon=True)
+        http_thread.start()
         self.runner.start()
         url = f"http://127.0.0.1:{self.port}/"
         if open_browser:
             threading.Timer(0.6, lambda: webbrowser.open(url)).start()
         print(f"Pair 交付台运行中: {url}\n数据目录: {self.store.home}\nCtrl+C 退出（任务状态已落盘，重开自动恢复）")
         try:
-            httpd.serve_forever()
+            while http_thread.is_alive():
+                http_thread.join(timeout=0.5)
         except KeyboardInterrupt:
-            pass
+            httpd.shutdown()
         finally:
             self.runner.stop()
             self.recorder.stop_all()
+            self.previews.stop_all()
             httpd.server_close()
             if self._lock_fp:
                 try:
@@ -1015,11 +1909,55 @@ class DeskServer:
 
 def main(argv=None) -> int:
     import argparse
-    ap = argparse.ArgumentParser(prog="atk desk")
-    ap.add_argument("--port", type=int, default=8765)
+    from .desk_service import DEFAULT_PORT, desk_url, is_running, start_desk, stop_desk, supervise
+
+    ap = argparse.ArgumentParser(
+        prog="atk desk",
+        description="Pair 交付台。默认在后台常驻（关终端也不停），用「退出交付台」或 desk stop 停止。",
+    )
+    ap.add_argument(
+        "action", nargs="?", default="start",
+        choices=["start", "stop", "status", "foreground"],
+        help="start=后台应用（默认） stop=停止 status=查看 foreground=挂在当前终端",
+    )
+    ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--no-browser", action="store_true")
+    ap.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--supervise", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--app", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--foreground", action="store_true")
     args = ap.parse_args(argv)
-    return DeskServer(DeskStore(), port=args.port).serve(open_browser=not args.no_browser)
+
+    if args.worker:
+        return DeskServer(DeskStore(), port=args.port).serve(open_browser=False)
+    if args.supervise:
+        return supervise(args.port)
+    if args.app:
+        from .desk_app import run_app
+        return run_app(args.port)
+    if args.action == "stop":
+        out = stop_desk(args.port)
+        print("已停止 Pair 交付台" if out.get("stopped") else "交付台未在运行（或正在退出）")
+        return 0
+    if args.action == "status":
+        info = is_running(args.port)
+        if info["http"]:
+            print(f"运行中  {info['url']}  worker={info['worker_pid'] or '-'}  supervisor={info['supervisor_pid'] or '-'}")
+            return 0
+        print("未在运行。启动：python -m agent_trace_kit.desk")
+        return 1
+    if args.foreground or args.action == "foreground":
+        return DeskServer(DeskStore(), port=args.port).serve(open_browser=not args.no_browser)
+
+    info = start_desk(args.port, open_browser=not args.no_browser, open_app=True)
+    url = info.get("url") or desk_url(args.port)
+    if info.get("already") or info.get("http"):
+        print(f"Pair 交付台已在后台运行: {url}")
+        print("任务栏有「Pair 交付台」窗口。关掉那个窗口，或执行 python -m agent_trace_kit.desk stop")
+        return 0
+    print(f"Pair 交付台已在后台启动: {url}")
+    print("关 PowerShell / 浏览器都不会停。要停：关掉任务栏窗口，或 python -m agent_trace_kit.desk stop")
+    return 0
 
 
 if __name__ == "__main__":

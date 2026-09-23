@@ -84,6 +84,8 @@ class GhRunner(Protocol):
     def viewer_login(self) -> str: ...
     def repo_view(self, owner: str, name: str) -> RemoteRepo | None: ...
     def repo_create(self, owner: str, name: str, description: str, private: bool) -> RemoteRepo: ...
+    def repo_delete(self, full_name: str) -> None: ...
+    def delete_remote_branches(self, full_name: str, branches: list[str]) -> list[str]: ...
 
 
 class CliGh:
@@ -94,7 +96,8 @@ class CliGh:
 
     def _run(self, args: list[str]) -> subprocess.CompletedProcess[str]:
         try:
-            return subprocess.run(
+            from .procmon import run_hidden
+            return run_hidden(
                 ["gh", *args], text=True, encoding="utf-8", errors="replace",
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=self._timeout,
             )
@@ -161,6 +164,29 @@ class CliGh:
                 default_branch="main", visibility="PRIVATE" if private else "PUBLIC",
             )
         return repo
+
+    def repo_delete(self, full_name: str) -> None:
+        """Delete the whole remote repo. Needs the ``delete_repo`` token scope."""
+        p = self._run(["repo", "delete", full_name, "--yes"])
+        if p.returncode != 0:
+            err = p.stderr.strip() or p.stdout.strip()
+            if "delete_repo" in err:
+                raise GitHubError(
+                    "当前 gh token 缺少 delete_repo 权限，请先执行 "
+                    "`gh auth refresh -h github.com -s delete_repo` 再重试"
+                )
+            raise GitHubError(f"删除 GitHub 仓库 {full_name} 失败：{err}")
+
+    def delete_remote_branches(self, full_name: str, branches: list[str]) -> list[str]:
+        """Delete remote branches via the git-refs API; return per-branch errors."""
+        import urllib.parse
+        errors: list[str] = []
+        for branch in branches:
+            ref = urllib.parse.quote(f"heads/{branch}", safe="/")
+            p = self._run(["api", f"repos/{full_name}/git/refs/{ref}", "-X", "DELETE"])
+            if p.returncode != 0:
+                errors.append(f"{branch}: {p.stderr.strip() or p.stdout.strip()}")
+        return errors
 
 
 def ensure_remote_repo(

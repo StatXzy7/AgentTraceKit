@@ -9,14 +9,24 @@ from . import oss as oss_mod
 from .checklist import run_checklist
 from .desk_store import DeskStore
 
+# Feishu bitable field order. Validity stays on the desk as an export gate and
+# is not a paste column — putting it here shifts GSB 结论 into the wrong cell.
 HEADERS = [
     "User Prompt", "提交人", "任务类型", "Harness", "任务难度", "语言/框架",
     "操作系统", "环境可复现等级", "初始环境快照",
     "A-SessionID", "A-轨迹文件", "A-产物快照", "A-运行录屏",
+    "A - 交付完整性（1-5）", "A - 交付完整性描述",
     "B-SessionID", "B-轨迹文件", "B-产物快照", "B-运行录屏",
-    "有效性", "GSB 结论", "GSB 理由",
+    "B - 交付完整性（1-5）", "B - 交付完整性描述",
+    "GSB 结论", "GSB 理由",
     "内部质检", "质检反馈", "备注",
 ]
+
+
+def _tsv_line(cells: list[str]) -> str:
+    buf = io.StringIO()
+    csv.writer(buf, dialect="excel-tab", lineterminator="\n").writerow(cells)
+    return buf.getvalue().rstrip("\n")
 
 
 def job_row(job: dict) -> list[str]:
@@ -33,8 +43,9 @@ def job_row(job: dict) -> list[str]:
         job.get("repro_level", ""),
         job.get("baseline_url", ""),
         a.get("session_id", ""), a.get("trace_url", ""), a.get("head_url", ""), a.get("video_url", ""),
+        str(review.get("a_delivery_score", "")), review.get("a_delivery_description", ""),
         b.get("session_id", ""), b.get("trace_url", ""), b.get("head_url", ""), b.get("video_url", ""),
-        review.get("validity", ""),
+        str(review.get("b_delivery_score", "")), review.get("b_delivery_description", ""),
         review.get("conclusion", ""),
         review.get("reason", ""),
         # QC-side columns (内部质检 / 质检反馈 / 备注): left blank for reviewers.
@@ -47,11 +58,14 @@ def export_tsv(job: dict, output: str | Path, *, strict: bool = True) -> dict:
     if strict and not report["ready"]:
         missing = [f"{x['group']}·{x['label']}" for x in report["items"] if x["blocking"] and not x["ok"]]
         raise ValueError("存在未完成的必填项，无法严格导出：\n- " + "\n- ".join(missing))
-    buf = io.StringIO()
-    writer = csv.writer(buf, dialect="excel-tab", lineterminator="\n")
-    writer.writerow(HEADERS)
-    writer.writerow(job_row(job))
-    text = buf.getvalue()
+    # One data row, no header: Feishu already has columns; a header row becomes
+    # a junk record, and an extra 有效性 cell shifts every field after B-录屏.
+    cells = job_row(job)
+    if len(cells) != len(HEADERS):
+        raise RuntimeError(
+            f"TSV 列数与飞书表头不一致：{len(cells)} != {len(HEADERS)}"
+        )
+    text = _tsv_line(cells)
     out = Path(output)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(text, encoding="utf-8")

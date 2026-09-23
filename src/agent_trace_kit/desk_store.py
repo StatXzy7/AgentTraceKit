@@ -32,15 +32,17 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "claude_command": "claude",
     "max_parallel_pairs": 2,
     "side_timeout_seconds": 1800,
-    # Gateway SSE streams for deep-thinking coding turns stall silently fairly
-    # often; the watchdog kills a tree with zero CPU/IO/transcript activity and
-    # the side is relaunched in-place until it completes.
-    "stall_seconds": 240,
+    # 0 = do not kill a live Claude on silence. Deep thinking waits on the
+    # gateway with near-zero CPU; killing that aborted complete turns.
+    # Retry only after the process exits/errors or the side timeout fires.
+    "stall_seconds": 0,
     # Upstream gateway (seed-code) cuts deep-thinking coding turns frequently;
     # every cut is retried in a fresh baseline copy until a truly complete turn
     # lands. 12 attempts covers prolonged upstream instability; each attempt can
     # take up to side_timeout_seconds, so this is a cap, not a quota to spend.
     "side_max_attempts": 12,
+    # Wall-clock budget for one side across all retries (not attempts × timeout).
+    "side_wall_budget_seconds": 14400,
     "activity_poll_seconds": 15,
     # claude -p permission mode. acceptEdits auto-denies ALL Bash in
     # non-interactive mode and models burn the whole turn trying workarounds;
@@ -63,6 +65,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "default_difficulty": "困难",
     "default_repro_level": "无外部依赖",
     "reviewer": "徐子扬",
+    # Built-in screen capture of the real product run (terminal + web). The
+    # operator records the genuine demo; recordings auto-stop at this cap so a
+    # forgotten recording cannot run unbounded. 89 rather than 90 to stay just
+    # under a strict 90s boundary check downstream. A few seconds is acceptable.
+    "video_max_seconds": 89,
+    "video_fps": 15,
     "env_overrides": {},
 }
 
@@ -95,12 +103,21 @@ class DeskStore:
             d.mkdir(parents=True, exist_ok=True)
 
     # ---------- settings ----------
+    @staticmethod
+    def _migrate_settings(data: dict[str, Any]) -> dict[str, Any]:
+        # The old default cap was exactly 90s; it sits on a strict downstream
+        # boundary. Move only that legacy default (not an operator-chosen value)
+        # to 89 without rewriting the persisted file.
+        if data.get("video_max_seconds") == 90:
+            data["video_max_seconds"] = 89
+        return data
+
     def settings(self) -> dict[str, Any]:
         with _LOCK:
             data = dict(DEFAULT_SETTINGS)
             if self.settings_path.exists():
                 data.update(json.loads(self.settings_path.read_text(encoding="utf-8")))
-            return data
+            return self._migrate_settings(data)
 
     def save_settings(self, patch: dict[str, Any]) -> dict[str, Any]:
         with _LOCK:
@@ -126,6 +143,11 @@ class DeskStore:
                 "head_sha": "", "head_url": "", "session_id": "", "jsonl_local": "",
                 "trace_url": "", "video_local": "", "video_url": "",
                 "started_at": "", "finished_at": "", "exit_code": None, "error": "", "retry_of": "",
+                # Structured per-attempt ledger (P0-1): one entry per launched
+                # attempt with its archived raw stream / transcript paths, so a
+                # discarded cut turn leaves auditable evidence instead of only a
+                # line in the run log.
+                "attempts": [],
             }
             settings = self.settings()
             job = {
@@ -161,10 +183,22 @@ class DeskStore:
                 "sides": {"A": side("A"), "B": side("B")},
                 "review": {
                     "validity": "", "conclusion": "", "reason": "",
+                    "a_delivery_score": "", "a_delivery_description": "",
+                    "b_delivery_score": "", "b_delivery_description": "",
                     "reviewer": settings.get("reviewer", ""), "note": "",
+                    # Human-only gate (P1-4): once the reviewer commits a
+                    # judgement with the no-AI attestation, run/retry actions are
+                    # refused server-side until an explicit unlock.
+                    "ai_confirmed": False, "ai_confirmed_at": "", "locked_at": "",
                 },
                 "uploads": {"A": {}, "B": {}},
                 "exported": False,
+                "delivery_quality_required": True,
+                # Visibility layer, independent of run/review state. An archived
+                # job is hidden from the default queue and never auto-resumed;
+                # its record/evidence are untouched and it can be restored.
+                "archived": False,
+                "archived_at": "",
             }
             self._atomic_write_json(self.job_path(job_id), job)
             return job
@@ -215,12 +249,21 @@ class DeskStore:
         with _LOCK:
             job = self.get_job(job_id)
             review = job["review"]
-            for key in ("validity", "conclusion", "reason", "reviewer", "note"):
+            for key in ("validity", "conclusion", "reason", "reviewer", "note",
+                        "a_delivery_score", "a_delivery_description",
+                        "b_delivery_score", "b_delivery_description",
+                        "ai_confirmed", "ai_confirmed_at", "locked_at"):
                 if key in patch:
                     review[key] = patch[key]
             job["updated_at"] = utc_now()
             self._atomic_write_json(self.job_path(job_id), job)
             return job
+
+    def set_archived(self, job_id: str, archived: bool) -> dict[str, Any]:
+        """Toggle the archive visibility flag without touching run/review data."""
+        patch = {"archived": bool(archived),
+                 "archived_at": utc_now() if archived else ""}
+        return self.update_job(job_id, patch)
 
     def evidence_dir(self, job_id: str) -> Path:
         path = self.evidence / job_id
@@ -231,6 +274,15 @@ class DeskStore:
         path = self.workspaces / job_id
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+    @staticmethod
+    def review_locked(job: dict[str, Any]) -> bool:
+        """True once a human judgement was committed with the no-AI attestation.
+
+        A locked pair refuses run/retry/prepare server-side; evidence and the GSB
+        text stay editable until an explicit unlock.
+        """
+        return bool(job.get("review", {}).get("locked_at"))
 
     # ---------- internals ----------
     @staticmethod

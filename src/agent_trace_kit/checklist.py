@@ -43,7 +43,40 @@ def _check(items: list, cid: str, group: str, label: str, ok: bool, detail: str,
     items.append({"id": cid, "group": group, "label": label, "ok": bool(ok), "detail": detail, "blocking": blocking})
 
 
+def _user_record_text(rec: dict) -> str:
+    msg = rec.get("message")
+    content = msg.get("content") if isinstance(msg, dict) else msg
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        return " ".join(
+            str(c.get("text", "")) for c in content if isinstance(c, dict) and c.get("type") == "text"
+        ).strip()
+    return ""
+
+
+def _is_harness_user_noise(rec: dict, text: str) -> bool:
+    """Claude Code injects extra type=user rows that are not a second human turn.
+
+    Typical noise: Read(image) writes a ``turnCompanion`` caption
+    ``[Image: original WxH…]`` with ``isMeta: true``; sidechain/Task prompts;
+    ``<command-name>`` / ``<system-reminder>`` wrappers.
+    """
+    # Desk injects the frozen prompt via `claude -p` (promptSource=sdk).
+    # Never drop that row even if later CLI flags are noisy.
+    if rec.get("promptSource") == "sdk":
+        return not bool(text)
+    if rec.get("isMeta") or rec.get("turnCompanion") or rec.get("isSidechain"):
+        return True
+    if not text or text.startswith("<"):
+        return True
+    if text.startswith("[Image:"):
+        return True
+    return False
+
+
 def _jsonl_user_texts(path: Path) -> list[str]:
+    """Prompt-like user texts in a transcript (one item == one human/SDK turn)."""
     texts: list[str] = []
     try:
         with path.open("r", encoding="utf-8", errors="replace") as f:
@@ -52,20 +85,12 @@ def _jsonl_user_texts(path: Path) -> list[str]:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if rec.get("type") != "user":
+                if not isinstance(rec, dict) or rec.get("type") != "user":
                     continue
-                msg = rec.get("message")
-                content = msg.get("content") if isinstance(msg, dict) else msg
-                text = ""
-                if isinstance(content, str):
-                    text = content
-                elif isinstance(content, list):
-                    text = " ".join(
-                        str(c.get("text", "")) for c in content if isinstance(c, dict) and c.get("type") == "text"
-                    )
-                text = text.strip()
-                if text and not text.startswith("<"):
-                    texts.append(text)
+                text = _user_record_text(rec)
+                if _is_harness_user_noise(rec, text):
+                    continue
+                texts.append(text)
     except OSError:
         pass
     return texts
@@ -264,6 +289,16 @@ def run_checklist(job: dict, *, online: bool = False) -> dict:
            f"理由（至少 {min_len} 字，Same 需更详细）", reason_ok,
            f"{len(reason)} 字" if reason else "未填写",
            blocking=is_valid_pair and review.get("conclusion") in CONCLUSIONS)
+    for side_name, prefix in (("A", "a"), ("B", "b")):
+        score = str(review.get(f"{prefix}_delivery_score", "")).strip()
+        description = str(review.get(f"{prefix}_delivery_description", "")).strip()
+        required = bool(job.get("delivery_quality_required")) and is_valid_pair
+        _check(items, f"{prefix}_delivery_score", "交付完整性",
+               f"{side_name} - 交付完整性（1-5）", score in {"1", "2", "3", "4", "5"},
+               score or "未评分", blocking=required)
+        _check(items, f"{prefix}_delivery_description", "交付完整性",
+               f"{side_name} - 交付完整性描述", bool(description),
+               f"{len(description)} 字" if description else "未填写", blocking=required)
     _check(items, "reviewer", "GSB", "标注员", bool(review.get("reviewer", "").strip()),
            review.get("reviewer", "") or "缺失", blocking=False)
 

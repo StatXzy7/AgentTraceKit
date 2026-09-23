@@ -14,6 +14,27 @@ atk
 v0.3.0 正式支持 Codex CLI；Claude Code、ZCode 和其他 Agent 计划支持。
 
 使用 `atk browse` 打开可视化 session 选择器，点击 **Collect & Review** 即可采集并进入完整浏览器工作台。工作台包含 Overview、Timeline、Evidence、Annotation、Files 和 Verify 按钮，日常操作无需继续使用命令行。使用 `atk view BUNDLE` 可直接打开工作台，`atk annotate BUNDLE` 可单独进入标注界面。标注保存在 `annotation/annotations.jsonl`，并通过稳定的 event ID 和原始行号回溯证据。多个 bundle 可用 `atk corpus index DIRECTORY` 建立本地可重建索引。
+## Pair 交付台（本地 A/B 跑题）
+
+仓库根目录**没有**名为「Pair 交付台」的 exe 或文件夹，这是正常的。交付台是用本仓库源码跑起来的本地网页，不是单独安装包。
+
+```powershell
+cd D:\myprojects\AgentTraceKit
+python -m pip install -e .
+python -m agent_trace_kit.desk          # 任务栏窗口 + 打开 http://127.0.0.1:8765
+python -m agent_trace_kit.desk status
+python -m agent_trace_kit.desk stop
+```
+
+也可以双击 `scripts\windows\start-desk.vbs`。关浏览器、关这个仓库文件夹都不会停交付台；关掉任务栏上的「Pair 交付台」或执行 `stop` 才会停。
+
+| 你想找的 | 实际位置 |
+| --- | --- |
+| 源码 | `src/agent_trace_kit/desk.py`、`desk_app.py`、`desk_service.py`、`desk_store.py` |
+| 启动脚本 | `scripts/windows/start-desk.vbs` |
+| 任务、A/B 工作区、轨迹、锁文件 | `C:\AgentTraceKit-data\desk\`（在 git 仓库外面；可用环境变量 `ATK_DESK_HOME` 改） |
+| 完整操作说明 | [docs/PAIR_DESK.md](docs/PAIR_DESK.md) |
+
 ## AB 目录评测与上传
 
 如果同一提示词需要在两个本地实现目录运行，可以直接启动本地 UI：
