@@ -56,7 +56,8 @@ def _stamp() -> str:
 
 def claude_version(command: str = "claude") -> str:
     try:
-        p = subprocess.run([command, "--version"], capture_output=True, text=True, timeout=15)
+        from .procmon import run_hidden
+        p = run_hidden([command, "--version"], capture_output=True, text=True, timeout=15)
         return p.stdout.strip() if p.returncode == 0 else ""
     except OSError:
         return ""
@@ -539,6 +540,7 @@ class PairRunner:
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace",
                 bufsize=1,
+                **procmon.hidden_console_kwargs(),
             )
             pump_done = threading.Event()
             signal: dict = {}

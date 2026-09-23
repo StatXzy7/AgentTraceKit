@@ -28,7 +28,8 @@ def video_duration_seconds(path: str | Path) -> float | None:
     if not shutil.which("ffprobe"):
         return None
     try:
-        p = subprocess.run(
+        from .procmon import run_hidden
+        p = run_hidden(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
             capture_output=True, text=True, timeout=30,

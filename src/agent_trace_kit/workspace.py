@@ -107,8 +107,9 @@ class GitError(RuntimeError):
 
 
 def git(args: list[str], cwd: str | Path, *, timeout: int = 120, check: bool = True) -> tuple[str, str, int]:
+    from .procmon import run_hidden
     try:
-        p = subprocess.run(
+        p = run_hidden(
             ["git", *args], cwd=str(cwd), text=True, encoding="utf-8", errors="replace",
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
         )
@@ -227,7 +228,8 @@ def has_uncommitted(workspace: str | Path) -> bool:
 def commit_all(workspace: str | Path, message: str) -> str:
     """Stage everything (including new files) and commit; returns HEAD sha."""
     git(["add", "-A"], workspace)
-    p = subprocess.run(
+    from .procmon import run_hidden
+    p = run_hidden(
         ["git", "diff", "--cached", "--quiet"], cwd=str(workspace),
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )

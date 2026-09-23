@@ -66,8 +66,9 @@ class PairSpec:
 
 def _git(directory: Path, *args: str) -> tuple[str, int]:
     try:
-        p = subprocess.run(["git", *args], cwd=directory, text=True, encoding="utf-8", errors="replace",
-                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
+        from .procmon import run_hidden
+        p = run_hidden(["git", *args], cwd=directory, text=True, encoding="utf-8", errors="replace",
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
         return p.stdout.strip(), p.returncode
     except (OSError, subprocess.TimeoutExpired) as exc:
         return str(exc), 1
@@ -109,13 +110,17 @@ def validate_spec(spec: PairSpec, require_decision: bool = True) -> list[dict[st
 
 def run_checks(directory: str | Path, commands: list[str], timeout: int = 900) -> dict[str, Any]:
     root = Path(directory).resolve()
+    from .procmon import hidden_console_kwargs
     results = []
     for command in commands:
         try:
             # shell=True is intentional: commands are user-supplied local checks,
             # and this preserves pipes/PowerShell-compatible commands on Windows.
+            # A hidden (not absent) console keeps shell grandchildren from
+            # allocating their own visible windows.
             p = subprocess.run(command, cwd=root, shell=True, text=True, encoding="utf-8", errors="replace",
-                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout,
+                               **hidden_console_kwargs())
             results.append({"command": command, "returncode": p.returncode, "output": p.stdout})
         except subprocess.TimeoutExpired as exc:
             partial = exc.stdout or ""

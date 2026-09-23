@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import ctypes
 import subprocess
+import sys
 from ctypes import wintypes
 from pathlib import Path
+from typing import Any, Sequence
 
 # CPU is reported in 100ns units; IO transfer counters are in bytes.
 CPU_EPSILON_100NS = 10_000_000        # 1.0s of root-process CPU per poll window
@@ -169,17 +171,55 @@ def tree_busy(prev: dict[int, dict], cur: dict[int, dict], pids: set[int], root_
     return False
 
 
+def hidden_creationflags() -> int:
+    """CREATE_NO_WINDOW for a leaf tool (netstat, taskkill) that spawns no shell.
+
+    Do not use this for ``claude`` or ``shell=True`` checks. A process started
+    with no console forces each console grandchild — Claude Code's per-command
+    ``powershell.exe`` — to allocate its own visible window.
+    """
+    if sys.platform != "win32":
+        return 0
+    return int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def hidden_console_kwargs() -> dict[str, Any]:
+    """Popen kwargs: one hidden console, inherited by console grandchildren.
+
+    ``CREATE_NEW_CONSOLE`` plus ``SW_HIDE`` gives the child a console that
+    already starts hidden. ``powershell.exe`` / ``cmd.exe`` spawned underneath
+    attach to it instead of opening a desktop window. Redirected stdout/stderr
+    are unchanged, so logs and the stall watchdog still see the same pipes.
+    """
+    if sys.platform != "win32":
+        return {}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= int(subprocess.STARTF_USESHOWWINDOW)
+    startupinfo.wShowWindow = int(subprocess.SW_HIDE)
+    return {
+        "startupinfo": startupinfo,
+        "creationflags": int(getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)),
+    }
+
+
+def run_hidden(args: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess[Any]:
+    """subprocess.run without flashing a console window on Windows."""
+    if sys.platform == "win32":
+        kwargs.setdefault("creationflags", hidden_creationflags())
+    return subprocess.run(args, **kwargs)
+
+
 def kill_tree(pid: int) -> None:
     """Kill the process and every descendant (taskkill /T /F)."""
     try:
-        subprocess.run(
+        run_hidden(
             ["taskkill", "/F", "/T", "/PID", str(pid)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
         )
     except (OSError, subprocess.TimeoutExpired):
         try:
-            subprocess.run(["taskkill", "/F", "/PID", str(pid)],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+            run_hidden(["taskkill", "/F", "/PID", str(pid)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
         except (OSError, subprocess.TimeoutExpired):
             pass
 
