@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import codecs
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -119,7 +120,9 @@ def terminal(spec: dict, *, stream=None, wait=time.sleep, clock=time.monotonic) 
     try:
         view.command(command)
         process = subprocess.Popen(command, cwd=spec['cwd'], stdout=subprocess.PIPE,
-                                   stderr=subprocess.STDOUT, **procmon.hidden_console_kwargs())
+                                   stderr=subprocess.STDOUT,
+                                   env={**os.environ, 'PYTHONUTF8': '1', 'PYTHONIOENCODING': 'utf-8'},
+                                   **procmon.hidden_console_kwargs())
         def timeout():
             if not done.is_set():
                 timed_out.set()

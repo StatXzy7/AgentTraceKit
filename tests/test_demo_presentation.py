@@ -8,7 +8,9 @@ import pytest
 from agent_trace_kit import demo_terminal
 
 
-def test_command_is_visible_before_process_launch_and_result_after_hold(tmp_path):
+def test_command_is_visible_before_process_launch_and_result_after_hold(tmp_path, monkeypatch):
+    monkeypatch.setenv('PYTHONUTF8', '0')
+    monkeypatch.setenv('PYTHONIOENCODING', 'ascii')
     result = tmp_path / 'process.json'
     spec = {'command': [sys.executable, '-c', 'print("RESULT-真实输出")'],
             'cwd': str(tmp_path), 'result': str(result), 'timeout': 10,
