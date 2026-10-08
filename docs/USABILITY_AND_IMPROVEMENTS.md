@@ -30,7 +30,7 @@
 
 当前发布的测试证据见 [GitHub Actions tests](https://github.com/StatXzy7/AgentTraceKit/actions/workflows/tests.yml)。以提交对应的运行结果为准；源码发布不代表当前生产服务器已升级。
 
-本地 Windows 在发布准备前运行现有框架测试：**788 passed, 5 skipped**。发布修正增加冻结基线、独立 Git 元数据、明确模型不匹配及 worker 配置的回归验证；最终结果以本次提交 CI 为准。没有为本次发布调用真实生成模型，也没有进行新的生产任务、对象存储上传或真实桌面录像验收。
+本地 Windows 最终全套框架测试：**801 passed, 5 skipped**（Python 3.13.9）。冻结基线、独立 Git 元数据、显式及继承模型不匹配、worker 私有配置均有回归验证；Python 3.11 的 Windows/Ubuntu 结果以本次提交 CI 为准。没有为本次发布调用真实生成模型，也没有进行新的生产任务、对象存储上传或真实桌面录像验收。
 
 ## 后续改进方向
 
