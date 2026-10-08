@@ -1,8 +1,8 @@
 """Mechanical completeness checklist for one pair.
 
 Every check is a deterministic rule over recorded facts — file existence,
-40-char SHAs, git ancestry, URL shape. Nothing here analyses trajectory
-content or judges model quality; the GSB decision stays entirely human.
+40-char SHAs, git ancestry, URL shape and actual tool dispatch receipts.
+These checks do not replace semantic review; the GSB decision stays human.
 """
 from __future__ import annotations
 
@@ -12,8 +12,9 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from .desk_store import CONCLUSIONS, DIFFICULTIES, REPRO_LEVELS, TASK_TYPES, VALIDITY
+from .desk_store import REPRO_LEVELS, TASK_TYPES, VALIDITY
 from . import workspace as ws
+from . import engines
 
 SHA_URL = re.compile(r"^https://[\w.-]+/[^/]+/[^/]+/commit/[0-9a-f]{40}$")
 URL_RE = re.compile(r"^https?://")
@@ -125,15 +126,21 @@ def _jsonl_models(path: Path) -> list[str]:
     return sorted(models)
 
 
-def _side_checks(items: list, job: dict, side_name: str, online: bool) -> None:
+def _side_checks(items: list, job: dict, side_name: str, online: bool) -> set[str]:
     side = job["sides"][side_name]
     group = f"{side_name} 侧"
+    used_models = []
     # Engineering-failure pairs are kept for audit, so a truncated/failed run
     # only blocks export for pairs still marked valid.
     voided = job.get("review", {}).get("validity", "") not in ("", "有效")
     wdir = side.get("workspace", "")
     _check(items, f"{side_name}_workspace", group, "独立工作区", bool(wdir) and Path(wdir).is_dir(),
            wdir or "未准备工作区")
+    if job.get("baseline_sha"):
+        initial = side.get("initial_sha", "")
+        _check(items, f"{side_name}_initial_sha", group, "工作区从冻结 commit 创建",
+               ws.is_sha40(initial) and initial == job.get("baseline_sha"),
+               initial or "缺少工作区初始 SHA，需重新准备该侧")
 
     sid = side.get("session_id", "")
     _check(items, f"{side_name}_session", group, "SessionID 非空", bool(sid), sid or "缺失")
@@ -143,35 +150,61 @@ def _side_checks(items: list, job: dict, side_name: str, online: bool) -> None:
     _check(items, f"{side_name}_jsonl", group, "轨迹 jsonl 存在且非空", jsonl_ok,
            jsonl if jsonl_ok else "未采集到轨迹文件")
     if jsonl_ok:
-        user_texts = _jsonl_user_texts(Path(jsonl))
+        from .compliance import audit_trace, trace_detail, resolved_report
+        compliance = audit_trace(jsonl)
+        _check(items, f"{side_name}_extra_ai", group, "原轨迹没有额外做题 AI 派发",
+               compliance["reason"] is None or resolved_report(compliance, side), trace_detail(compliance), blocking=not voided)
+        if compliance["sessions"]:
+            _check(items, f"{side_name}_raw_session", group, "原轨迹只属于本侧绑定会话",
+                   compliance["sessions"] == [sid], ", ".join(compliance["sessions"]))
+        codex = engines.job_engine(job) == "codex"
+        recovered = codex and bool(side.get("completion_recovery"))
+        evidence = engines.codex_evidence(jsonl, prompt=job.get("prompt", ""),
+                                         allow_recovered_turns=recovered) if codex else {}
+        user_texts = evidence["users"] if codex else _jsonl_user_texts(Path(jsonl))
         prompt = job.get("prompt", "").strip()
-        hit = any(prompt and prompt in t for t in user_texts)
+        if codex:
+            prompt = engines.normalized_prompt(prompt)
+        hit = (bool(prompt) and prompt in user_texts) if codex else any(prompt and prompt in t for t in user_texts)
         _check(items, f"{side_name}_prompt_match", group, "轨迹中的提示词与本题一致", hit,
                "已在轨迹用户消息中找到该 prompt" if hit else "轨迹里找不到本题 prompt，可能绑错了会话")
-        _check(items, f"{side_name}_single_turn", group, "只有一轮有效交互（规范要求首轮）",
-               len(user_texts) == 1, f"识别到 {len(user_texts)} 条用户消息", blocking=False)
-        used_models = _jsonl_models(Path(jsonl))
-        pinned = _normalize_model(ws.PINNED_MODEL)
-        mismatched = [m for m in used_models if _normalize_model(m) != pinned]
-        _check(items, f"{side_name}_model", group, f"使用指定模型（{ws.PINNED_MODEL}）",
+        turns = evidence.get("user_turn_count", len(user_texts))
+        _check(items, f"{side_name}_single_turn", group, "生产单提示词协议（不作为官方轮数质检规则）",
+               turns == 1, f"识别到 {turns} 轮用户交互", blocking=bool(job.get("execution_policy")))
+        used_models = evidence["models"] if codex else _jsonl_models(Path(jsonl))
+        expected = job.get("codex_model", "") if codex else job.get("claude_model") or ws.PINNED_MODEL
+        mismatched = [m for m in used_models if expected and _normalize_model(m) != _normalize_model(expected)]
+        _check(items, f"{side_name}_model", group, f"使用指定模型（{expected}）" if expected else "记录 Codex 实际模型（继承本机配置）",
                bool(used_models) and not mismatched,
                "轨迹记录模型：" + ", ".join(used_models) if used_models else "轨迹里读不到模型名",
-               blocking=False)
+               blocking=bool(job.get("codex_model" if codex else "claude_model")) and not voided)
 
         # Gateway cuts mid-turn leave a detectable tail: a synthetic "API Error"
         # final message (e.g. seed-code 504) or a transcript ending right after a
         # tool_result. Such evidence must never be exported as a valid product.
-        reason = ws.transcript_interruption_reason(Path(jsonl))
+        if codex:
+            _check(items, f"{side_name}_session_match", group, "轨迹 SessionID 与绑定一致",
+                   evidence.get("session_id") == sid, str(evidence.get("session_id") or "缺失"))
+        reason = evidence["reason"] if codex else ws.transcript_interruption_reason(Path(jsonl))
         reason_labels = {
             "api_error": "轨迹末尾是网关报错（API Error，如 504 断流），本轮被中途截断",
             "dangling_tool_result": "轨迹停在工具返回后、没有模型收尾，本轮被中途截断",
             "no_assistant": "轨迹里没有任何模型回复，本轮未真正执行",
             "unreadable": "轨迹文件无法读取",
+            "malformed_json": "轨迹含损坏或截断的 JSONL，不能作为完整证据",
+            "missing_completion": "Codex rollout 缺少轮次完成标记",
+            "turn_failed": "Codex 轮次失败或被中止",
+            "extra_ai_dispatched": "已派发额外做题 AI，主 CLI 结束不能证明合规",
+            "extra_ai_needs_review": "额外 AI 调用缺少明确结果或 shell 模型调用需核对业务用途",
         }
-        _check(items, f"{side_name}_trace_complete", group, "轨迹完整（首轮未被网关截断）",
+        _check(items, f"{side_name}_trace_complete", group,
+               "续接末轮完整（前序失败保留，不等同于首轮完成）" if recovered else "轨迹完整（首轮未被网关截断）",
                reason is None,
-               reason_labels.get(reason, "首轮完整，最后一次工具调用后有模型收尾"),
+               reason_labels.get(reason, "末轮完成，前序尝试见原始轨迹" if recovered else "首轮完整，最后一次工具调用后有模型收尾"),
                blocking=not voided)
+        if recovered and evidence.get("historical_unresolved_tool_calls"):
+            _check(items, f"{side_name}_interrupted_tools", group, "前序中断工具调用已保留（需复核副作用）",
+                   False, ", ".join(evidence["historical_unresolved_tool_calls"]), blocking=False)
 
     sha = side.get("head_sha", "")
     sha_ok = ws.is_sha40(sha)
@@ -230,6 +263,9 @@ def _side_checks(items: list, job: dict, side_name: str, online: bool) -> None:
                blocking=not voided)
 
 
+    return {_normalize_model(model) for model in used_models}
+
+
 def run_checklist(job: dict, *, online: bool = False) -> dict:
     items: list = []
 
@@ -237,11 +273,11 @@ def run_checklist(job: dict, *, online: bool = False) -> dict:
            f"{len(job.get('prompt', ''))} 字符")
     _check(items, "task_type", "题目", "任务类型", job.get("task_type") in TASK_TYPES,
            job.get("task_type", "") or "缺失")
-    _check(items, "difficulty", "题目", "任务难度（仅困难/地狱）", job.get("difficulty") in DIFFICULTIES,
+    _check(items, "difficulty", "题目", "任务难度已填写（实际难度需人工核对）", bool(job.get("difficulty")),
            job.get("difficulty", "") or "缺失")
     _check(items, "stack", "题目", "语言/框架", bool(job.get("stack", "").strip()),
            job.get("stack", "") or "缺失")
-    _check(items, "harness", "环境", "Harness 为 Claude Code", job.get("harness") == "Claude Code",
+    _check(items, "harness", "环境", "Harness 为 Claude Code / Codex CLI", job.get("harness") in engines.ENGINE_LABELS.values(),
            job.get("harness", ""))
     _check(items, "harness_version", "环境", "Harness 版本", bool(job.get("harness_version")),
            job.get("harness_version", "") or "准备任务时自动采集")
@@ -250,6 +286,12 @@ def run_checklist(job: dict, *, online: bool = False) -> dict:
            job.get("repro_level", "") or "缺失")
 
     baseline_sha = job.get("baseline_sha", "")
+    if job.get("source_mode") == "github_commit":
+        requested = job.get("source_commit", "")
+        _check(items, "baseline_requested_commit", "初始快照", "冻结 SHA 与指定 commit 一致",
+               bool(re.fullmatch(r"[0-9a-fA-F]{7,40}", requested))
+               and ws.is_sha40(baseline_sha) and baseline_sha.lower().startswith(requested.lower()),
+               f"指定：{requested}；冻结：{baseline_sha or '尚未准备'}")
     _check(items, "baseline_sha", "初始快照", "40 位完整 SHA", ws.is_sha40(baseline_sha),
            baseline_sha or "未在基线仓库提交")
     baseline_url = job.get("baseline_url", "")
@@ -258,8 +300,12 @@ def run_checklist(job: dict, *, online: bool = False) -> dict:
     _check(items, "baseline_pushed", "初始快照", "已 push，评测方可访问", bool(job.get("baseline_pushed")),
            "已 push" if job.get("baseline_pushed") else "未确认")
 
-    _side_checks(items, job, "A", online)
-    _side_checks(items, job, "B", online)
+    a_models = _side_checks(items, job, "A", online)
+    b_models = _side_checks(items, job, "B", online)
+    _check(items, "models_same", "一致性", "A/B 原轨迹中的实际模型一致",
+           bool(a_models and b_models) and a_models == b_models,
+           f"A: {', '.join(sorted(a_models)) or '未识别'}; B: {', '.join(sorted(b_models)) or '未识别'}",
+           blocking=job.get("review", {}).get("validity", "") in ("", "有效"))
 
     a = job["sides"]["A"]
     b = job["sides"]["B"]
@@ -279,16 +325,20 @@ def run_checklist(job: dict, *, online: bool = False) -> dict:
     # A voided pair is recorded for audit but excluded from evaluation, so the
     # preference judgement is not required; for a valid pair it blocks export.
     is_valid_pair = validity == "有效"
-    _check(items, "conclusion", "GSB", "GSB 结论（A 更好 / Same / B 更好）",
-           review.get("conclusion") in CONCLUSIONS, review.get("conclusion", "") or "未选择",
+    _check(items, "conclusion", "GSB", "GSB 结论已填写（含义与理由需一致）",
+           bool(str(review.get("conclusion", "")).strip()), review.get("conclusion", "") or "未选择",
            blocking=is_valid_pair)
     reason = review.get("reason", "").strip()
-    min_len = 80 if review.get("conclusion") == "Same" else 30
-    reason_ok = len(reason) >= min_len
+    reason_ok = bool(reason)
     _check(items, "reason", "GSB",
-           f"理由（至少 {min_len} 字，Same 需更详细）", reason_ok,
+           "理由已填写（比较依据及权衡需人工核对）", reason_ok,
            f"{len(reason)} 字" if reason else "未填写",
-           blocking=is_valid_pair and review.get("conclusion") in CONCLUSIONS)
+           blocking=is_valid_pair)
+    from .compliance import review_issues
+    issues = review_issues(job)
+    _check(items, "review_consistency", "GSB", "结论侧别与题面引用无已检出冲突",
+           not issues, "；".join(x["detail"] for x in issues) or "窄范围检查未检出冲突；不等同于完整语义质审",
+           blocking=is_valid_pair)
     for side_name, prefix in (("A", "a"), ("B", "b")):
         score = str(review.get(f"{prefix}_delivery_score", "")).strip()
         description = str(review.get(f"{prefix}_delivery_description", "")).strip()

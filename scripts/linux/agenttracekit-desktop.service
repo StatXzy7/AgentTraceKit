@@ -1,0 +1,25 @@
+[Unit]
+Description=AgentTraceKit private Linux recording desktop
+After=network.target
+
+[Service]
+Type=simple
+User=atk
+Group=atk
+Environment=HOME=/home/atk
+Environment=DISPLAY=:99
+Environment=XAUTHORITY=/home/atk/.Xauthority
+Environment=LANG=C.UTF-8
+ExecStart=/bin/bash /opt/agenttracekit/current/scripts/linux/desktop.sh
+ExecStartPost=/bin/bash -c 'for i in {1..50}; do /usr/bin/xdpyinfo -display :99 >/dev/null 2>&1 && exit 0; sleep 0.2; done; exit 1'
+Restart=always
+RestartSec=3
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=full
+PrivateTmp=no
+MemoryMax=400M
+
+[Install]
+WantedBy=multi-user.target

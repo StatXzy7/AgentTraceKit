@@ -1,0 +1,42 @@
+[Unit]
+Description=AgentTraceKit Pair Desk
+After=network-online.target agenttracekit-desktop.service
+Wants=network-online.target agenttracekit-desktop.service
+StartLimitIntervalSec=120
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=atk
+Group=atk
+WorkingDirectory=/opt/agenttracekit/current
+Environment=HOME=/home/atk
+Environment=ATK_DESK_HOME=/var/lib/agenttracekit/desk
+Environment=PYTHONUTF8=1
+Environment=PYTHONIOENCODING=utf-8
+Environment=PYTHONUNBUFFERED=1
+Environment=LANG=C.UTF-8
+Environment=DISPLAY=:99
+Environment=XAUTHORITY=/home/atk/.Xauthority
+Environment=PLAYWRIGHT_BROWSERS_PATH=/home/atk/.cache/ms-playwright
+Environment=PATH=/opt/agenttracekit/venv/bin:/opt/agenttracekit/runtime/node/bin:/opt/agenttracekit/runtime/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin
+ExecStartPre=/usr/bin/rm -f /var/lib/agenttracekit/desk/desk.stop
+ExecStart=/opt/agenttracekit/venv/bin/python -m agent_trace_kit.desk --supervise --port 8765
+Restart=always
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/atk /var/lib/agenttracekit
+PrivateTmp=no
+CPUQuota=180%
+MemoryHigh=2500M
+MemoryMax=3G
+TasksMax=512
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

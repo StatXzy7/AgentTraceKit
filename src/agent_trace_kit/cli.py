@@ -11,7 +11,7 @@ from .verify import verify_bundle
 from .config import DEFAULTS, load_config, redacted, write_toml
 from .pairwise import create_pair, load_pair, bind_side, import_review, export_pair
 from .pair_ui import serve_pair_ui
-VERSION='0.4.0'
+VERSION='0.5.0'
 try: sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 except Exception: pass
 def _out_root(): return Path(os.environ.get('AGENT_TRACE_KIT_OUTPUT',Path.cwd()/'AgentTraceKit-output'))

@@ -1,21 +1,21 @@
 """Background execution engine for A/B pairs.
 
 - one queue, bounded parallelism (max parallel pairs + both sides concurrent)
-- the model itself runs exactly once per side with the frozen prompt
-- harness/model configuration is inherited from the user's environment
-  (cc-switch / global settings); this engine never sets ANTHROPIC_MODEL
-- job state lives on disk, so a crashed process can resume on next start:
-  running sides become 'failed' and can be retried by re-copying the workspace
+- default evaluation runs use a frozen prompt and clean baseline retries
+- each pair records its CLI; model configuration is inherited unless an
+  explicit Codex model was selected; this engine never sets ANTHROPIC_MODEL
+- opt-in completion recovery keeps work, resumes the bound Codex session and
+  preserves attempt counts/deadlines across restarts
 
-Upstream gateway cuts (silent SSE stalls, mid-turn 504, truncated transcripts)
-are treated as transient infrastructure faults, never as model results: the
-attempt is classified, thrown away, the workspace is re-copied from the
-baseline and the side is relaunched with exponential backoff until a complete
-turn is produced or the attempt cap is reached.
+Upstream gateway cuts are recorded as incomplete attempts, never as completed
+model results. Recovery mode records extra continuation turns explicitly;
+default mode retains its original fresh-baseline policy.
 """
 from __future__ import annotations
 
+import io
 import json
+import hashlib
 import os
 import queue
 import random
@@ -26,6 +26,7 @@ import tempfile
 import threading
 import time
 from datetime import datetime, timezone
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Callable
 
@@ -33,6 +34,8 @@ from . import ghutil
 from . import jobobj
 from . import procmon
 from . import workspace as ws
+from . import engines
+from . import baseline as baseline_mod
 from .desk_store import DeskStore
 
 # Minimum attempts even if settings.json carries an older, smaller value:
@@ -47,6 +50,28 @@ MAX_SIDE_WALL_SECONDS = 8 * 3600
 
 MAX_PARALLEL_PAIRS = 16
 MAX_SIDE_ATTEMPTS = 16
+
+COMPLETION_PROMPT = (
+    "这是运行框架在接口中断或输出达到上限后的自动续接。请继续本会话原始任务，"
+    "保留并先检查当前工作区已有进度，不要从头重建。将剩余实现拆成小段及时写入文件，"
+    "逐步运行实际测试、修复失败并完成原要求的演示配置。避免长篇重复规划；"
+    "仅在实际完成后报告结果，明确保留未完成或失败的事实。"
+)
+
+
+def completion_retryable(result: dict) -> bool:
+    """Only observed transient failures/output exhaustion permit continuation."""
+    if result.get("aborted") or result.get("completed"):
+        return False
+    message = str(result.get("failure") or "")
+    if re.search(r"insufficient_quota|unauthori[sz]ed|forbidden|blocked by policy|invalid_api_key", message, re.I):
+        return False
+    status = re.search(r"(?:HTTP|unexpected status|last status:)\s*(\d{3})\b", message, re.I)
+    if status and int(status.group(1)) not in (408, 429, 500, 502, 503, 504):
+        return False
+    return bool(result.get("retryable") or re.search(
+        r"stream disconnected|connection reset|timed out|timeout|total-timeout|"
+        r"max_output_tokens|HTTP\s*(?:408|429|500|502|503|504)|单侧总超时", message, re.I))
 
 
 def watchdog_idle_seconds(
@@ -91,7 +116,7 @@ def side_wall_seconds(settings: dict) -> int:
 _FINITE_PY_MODULES = {
     "unittest", "pytest", "pip", "ensurepip", "py_compile", "compileall",
     "doctest", "ruff", "mypy", "black", "flake8", "pylint", "isort", "tests",
-    "venv", "coverage", "tox", "nox", "build",
+    "venv", "coverage", "tox", "nox", "build", "json",
 }
 _START_SUBSTRINGS = (
     "npm start", "npm run start", "npm run dev", "npm run serve", "npm run preview",
@@ -221,6 +246,8 @@ def _feed_stdin(proc: subprocess.Popen, data: str, timeout: float = 30) -> None:
 
     def _write() -> None:
         try:
+            if isinstance(proc.stdin, io.TextIOWrapper):
+                proc.stdin.reconfigure(newline="")
             proc.stdin.write(data)
             proc.stdin.flush()
         except (OSError, ValueError):
@@ -245,7 +272,7 @@ def _feed_stdin(proc: subprocess.Popen, data: str, timeout: float = 30) -> None:
 def _reap_check(proc: subprocess.Popen, job: "jobobj.KillJob", assigned: bool) -> None:
     if assigned:
         job.terminate()
-    if proc.poll() is None and proc.pid:
+    if proc.pid and (os.name != "nt" or proc.poll() is None):
         procmon.kill_tree(proc.pid)
     _wait_proc(proc, timeout=15)
 
@@ -313,6 +340,16 @@ def _stamp() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def codex_retry_backoff_seconds(attempt: int, rng: random.Random) -> int:
+    """60, 120, 240, ... seconds plus positive jitter, capped at 15 minutes."""
+    base = min(720, 60 * 2 ** min(max(0, attempt - 2), 4))
+    return base + int(base * 0.25 * rng.random())
+
+
+def _managed_codex(job: dict) -> bool:
+    return engines.job_engine(job) == "codex" and (job.get("cli_connection") or {}).get("mode") == "project"
+
+
 def claude_version(command: str = "claude") -> str:
     try:
         from .procmon import run_hidden
@@ -324,6 +361,7 @@ def claude_version(command: str = "claude") -> str:
 
 class PairRunner:
     def __init__(self, store: DeskStore):
+        self.before_pair = None  # Optional host resource gate, supplied by DeskServer.
         self.store = store
         self._queue: "queue.Queue[str]" = queue.Queue()
         self._stop = threading.Event()
@@ -389,6 +427,10 @@ class PairRunner:
                     info = {}
                 registered.add(f"{info.get('job_id', '?')}/{info.get('side', '?')}")
                 pid = int(info.get("pid") or 0)
+                if os.name != "nt" and pid:
+                    current = procmon.snapshot().get(pid)
+                    if not current or not info.get("process_start") or current.get("start_time") != info["process_start"]:
+                        pid = 0  # Do not kill an unrelated process after PID reuse/reboot.
                 if pid:
                     try:
                         procmon.kill_tree(pid)
@@ -414,7 +456,8 @@ class PairRunner:
                     can_resume = bool(job.get("baseline_sha")) and not self.store.review_locked(job)
                     note = (
                         "交付台重启，已终止上次未完成的运行"
-                        + ("，将自动从基线重跑" if can_resume else "；点「重跑该侧」从基线重新执行")
+                        + (("，将保留工作区续接" if _managed_codex(job) and self.store.settings().get("codex_completion_recovery")
+                            else "，将自动从基线重跑") if can_resume else "；点「重跑该侧」从基线重新执行")
                         + ("（旧进程已清理）" if any(x.startswith(f"{job['id']}/{side_name}") for x in killed) else "")
                     )
                     self.store.update_side(job["id"], side_name, {
@@ -430,7 +473,7 @@ class PairRunner:
                 self.store.update_job(job["id"], {"status": "ready" if changed else job["status"]})
         for job_id, side_name in resume:
             try:
-                self.retry_side(job_id, side_name, enqueue=False)
+                self.retry_side(job_id, side_name, enqueue=False, renew_budget=False)
             except Exception as exc:
                 self.store.update_side(job_id, side_name, {
                     "status": "failed",
@@ -452,11 +495,12 @@ class PairRunner:
         self.ensure_workers()
 
     def ensure_workers(self) -> int:
-        """Match the worker pool to current settings. Scale-up is immediate.
+        """Grow the worker pool; admission also enforces the current pair limit.
 
         The pool is created once at desk boot from whatever the setting was
         *then*; saving 8 later used to do nothing until restart. Extra idle
-        workers just wait on the queue and pick up queued pairs at once.
+        workers remain idle after a reduction. Existing pairs drain naturally;
+        the admission check prevents those workers from exceeding the new cap.
         """
         wanted = max(1, min(MAX_PARALLEL_PAIRS, int(
             self.store.settings().get("max_parallel_pairs", 2) or 2)))
@@ -502,12 +546,23 @@ class PairRunner:
     # ---------- worker ----------
     def _worker_loop(self) -> None:
         while not self._stop.is_set():
-            try:
-                job_id = self._queue.get(timeout=1.0)
-            except queue.Empty:
-                continue
+            job_id = None
+            # Reserve capacity and dequeue under the same lock. Pool size alone
+            # cannot enforce a reduced limit while old workers still exist.
             with self._lock:
-                self._active[job_id] = True
+                if not self._queue.empty():
+                    limit = max(1, min(MAX_PARALLEL_PAIRS, int(
+                        self.store.settings().get("max_parallel_pairs", 2) or 2)))
+                    if sum(self._active.values()) < limit:
+                        try:
+                            job_id = self._queue.get_nowait()
+                        except queue.Empty:
+                            pass
+                        else:
+                            self._active[job_id] = True
+            if job_id is None:
+                self._stop.wait(0.25)
+                continue
             try:
                 self._run_job(job_id)
             except Exception as exc:  # never kill the worker thread
@@ -526,11 +581,15 @@ class PairRunner:
                     job = self.store.get_job(job_id)
                 except Exception:
                     job = None
-                if job and not self.store.review_locked(job) and job.get("status") != "evidence_ready":
+                if (job and not self.store.review_locked(job) and job.get("status") != "evidence_ready"
+                        and job.get("baseline_prepared") is not False):
                     if any(job["sides"][s]["status"] in ("pending", "preparing") for s in ("A", "B")):
                         self.enqueue(job_id)
 
     def _run_job(self, job_id: str) -> None:
+        while self.before_pair and not self.before_pair():
+            if self._stop.wait(1):
+                return
         job = self.store.get_job(job_id)
         # Re-check at dequeue time: the job may have been archived while it was
         # sitting in the in-memory queue. Archived jobs never start a run.
@@ -541,6 +600,10 @@ class PairRunner:
         # Skip sides that already finished (e.g. single-side retry); skip whole done jobs.
         if job.get("status") == "evidence_ready":
             return
+        if job.get("baseline_prepared") is False:
+            # A clone/submodule/side checkout may have failed after the SHA was
+            # frozen. Resume preparation before launching either CLI.
+            self.prepare(job_id)
         self.store.update_job(job_id, {"status": "running", "error": ""})
         # Re-read after the status flip: retry_side may have just copied a
         # pending workspace, and a stale snapshot would skip the side to run.
@@ -633,25 +696,38 @@ class PairRunner:
         return {**info, "github": repo.__dict__, "created": created}
 
     def prepare(self, job_id: str) -> dict:
-        """Snapshot the baseline repo and copy A/B workspaces. Idempotent-ish."""
+        """Prepare a baseline and A/B workspaces, retaining a frozen imported SHA."""
         job = self.store.get_job(job_id)
+        if any(self.is_side_live(job_id, s) for s in ("A", "B")):
+            raise RuntimeError("任务正在运行，不能重新准备基线")
         baseline = job.get("baseline_repo", "")
         provisioned: dict | None = None
-        if not baseline or not Path(baseline).is_dir():
-            provisioned = self._provision_baseline(job)
-            baseline = provisioned["path"]
-        if not baseline or not Path(baseline).is_dir():
-            raise RuntimeError("基线仓库目录无效")
-        if ws.has_uncommitted(baseline):
-            raise RuntimeError("基线仓库有未提交改动，请先在基线仓库提交后再准备任务")
-        snap = ws.snapshot_baseline(baseline)
+        if job.get("source_mode") == "github_commit":
+            snap = baseline_mod.prepare_commit_baseline(
+                job["source_repo"], job.get("baseline_sha") or job["source_commit"],
+                self.store.workspace_pair_dir(job_id) / "baseline",
+            )
+            baseline = snap["path"]
+        else:
+            if job.get("source_mode") == "local" and (not baseline or not Path(baseline).is_dir()):
+                raise RuntimeError("本地基线仓库目录无效，请填写已有 Git 仓库路径")
+            if not baseline or not Path(baseline).is_dir():
+                provisioned = self._provision_baseline(job)
+                baseline = provisioned["path"]
+            if not baseline or not Path(baseline).is_dir():
+                raise RuntimeError("基线仓库目录无效")
+            if ws.has_uncommitted(baseline):
+                raise RuntimeError("基线仓库有未提交改动，请先在基线仓库提交后再准备任务")
+            snap = ws.snapshot_baseline(baseline)
         self.store.update_job(job_id, {
+            "baseline_repo": baseline,
             "baseline_sha": snap["sha"], "baseline_url": snap["url"],
             "baseline_branch": snap["branch"], "baseline_pushed": True,
-            "harness_version": claude_version(self.store.settings().get("claude_command", "claude")),
-            "status": "ready",
+            "harness_version": engines.cli_version(self.store.settings(), engines.job_engine(job)),
+            "baseline_prepared": False, "status": "preparing",
         })
         pair_dir = self.store.workspace_pair_dir(job_id)
+        job = self.store.get_job(job_id)
         results = {}
         for side_name in ("A", "B"):
             side = self.store.get_job(job_id)["sides"][side_name]
@@ -659,16 +735,36 @@ class PairRunner:
                 results[side_name] = "kept"
                 continue
             dest = pair_dir / side_name.lower()
-            info = ws.prepare_side_workspace(
-                baseline, dest, side["branch"], job.get("copy_excludes", ""),
-            )
-            self.store.update_side(job_id, side_name, {"workspace": info["workspace"], "status": "pending"})
+            try:
+                info = self._prepare_workspace(job, dest, side["branch"])
+            except Exception as exc:
+                self.store.update_job(job_id, {"status": "failed", "error": f"{side_name} 侧准备失败：{exc}"})
+                raise
+            self.store.update_side(job_id, side_name, {
+                "workspace": info["workspace"], "status": "pending", "initial_sha": info["head"],
+            })
             results[side_name] = "prepared"
+        self.store.update_job(job_id, {"baseline_prepared": True, "status": "ready", "error": ""})
         return {"baseline": snap, "sides": results, "provisioned": provisioned}
 
+    def _prepare_workspace(self, job: dict, dest: str | Path, branch: str) -> dict:
+        if job.get("source_mode") == "github_commit":
+            return baseline_mod.prepare_commit_side(
+                job["baseline_repo"], dest, branch, job["baseline_sha"], agent=engines.job_engine(job),
+            )
+        return ws.prepare_side_workspace(
+            job["baseline_repo"], dest, branch, job.get("copy_excludes", ""),
+            baseline_sha=job["baseline_sha"],
+            **({"agent": "codex"} if engines.job_engine(job) == "codex" else {}),
+        )
+
     def run_side(self, job_id: str, side_name: str) -> None:
+        key = f"{job_id}/{side_name}"
+        self._clear_abort(key)
         settings = self.store.settings()
         job = self.store.get_job(job_id)
+        managed_codex = _managed_codex(job)
+        completion_mode = managed_codex and bool(settings.get("codex_completion_recovery"))
         side = job["sides"][side_name]
         wdir = side.get("workspace", "")
         if not wdir or not Path(wdir).is_dir():
@@ -679,27 +775,46 @@ class PairRunner:
         # Never let a stale low setting defeat gateway-cut retries.
         max_attempts = max(MIN_MAX_ATTEMPTS, min(MAX_SIDE_ATTEMPTS, max(
             1, int(settings.get("side_max_attempts", MIN_MAX_ATTEMPTS)))))
+        if managed_codex:
+            max_attempts = max(1, min(16 if completion_mode else 10, int(settings.get("codex_side_max_attempts", 3))))
         stall_after = stall_seconds_from_settings(settings)
         poll_every = max(5, int(settings.get("activity_poll_seconds", 15)))
         timeout = int(settings.get("side_timeout_seconds", 1800))
         wall = side_wall_seconds(settings)
         rng = random.Random(f"{job_id}/{side_name}")
 
+        attempts_ledger = list(side.get("attempts") or [])
+        # A crash can occur after writing the stream but before saving its
+        # ledger row. Count and retain that attempt instead of overwriting it.
+        recorded = {int(row["attempt"]) for row in attempts_ledger}
+        for stream in sorted((evidence_dir / "attempts").glob(f"{side_name.lower()}-*-stream.jsonl")):
+            match = re.fullmatch(r"[ab]-(\d+)-stream\.jsonl", stream.name)
+            if match and int(match[1]) not in recorded:
+                attempts_ledger.append({"attempt": int(match[1]), "status": "interrupted",
+                                        "stream_path": str(stream), "session_id": self._stream_session_id(stream)})
+        attempts_ledger.sort(key=lambda row: int(row["attempt"]))
+        first_attempt = max((int(row["attempt"]) for row in attempts_ledger), default=0) + 1
+        # Manual reruns receive a new bounded allowance. Attempt IDs remain
+        # cumulative so old streams and transcripts can never be overwritten.
+        budget_start = int(side.get("attempt_budget_start") or 0)
+        last_attempt = budget_start + max_attempts
+        started = time.time()
+        deadline_key = "completion_deadline_epoch" if completion_mode else "clean_deadline_epoch"
+        deadline = float(side.get(deadline_key) or started + wall)
+        wall = min(wall, max(0, deadline - started))
         self.store.update_side(job_id, side_name, {
             "status": "running", "started_at": _stamp(), "error": "",
-            "attempt_count": 1, "attempts": [],
+            "attempt_count": first_attempt - 1, "attempts": attempts_ledger,
+            deadline_key: deadline, "completion_recovery": completion_mode,
         })
-        log_path.write_text("", encoding="utf-8")
-        started = time.time()
+        if not attempts_ledger:
+            log_path.write_text("", encoding="utf-8")
         result = None
-        attempts_log: list[str] = []
-        attempts_ledger: list[dict] = []
-        key = f"{job_id}/{side_name}"
-        # Drop a stale flag from a previous run of this side. Do NOT discard
-        # between attempts: abort during archive/backoff would otherwise be lost.
-        self._clear_abort(key)
+        attempts_log = list(side.get("attempts_log") or [])
+        # Keep abort requests throughout archive/backoff and later attempts.
 
-        for attempt in range(1, max_attempts + 1):
+        for attempt in range(first_attempt, last_attempt + 1):
+            budget_attempt = attempt - budget_start
             if time.time() - started >= wall:
                 with log_path.open("a", encoding="utf-8") as f:
                     f.write(f"\n[watchdog] 单侧总预算 {wall}s 已用尽，停止重试\n")
@@ -715,25 +830,32 @@ class PairRunner:
             if self._is_aborted(key):
                 break
             attempt_started = _stamp()
-            if attempt > 1:
-                wait = retry_backoff_seconds(attempt, rng)
+            if budget_attempt > 1:
+                wait = (codex_retry_backoff_seconds(budget_attempt, rng) if managed_codex
+                        else retry_backoff_seconds(budget_attempt, rng))
                 with log_path.open("a", encoding="utf-8") as f:
-                    f.write(f"\n\n=== 第 {attempt}/{max_attempts} 次尝试：重新复制干净工作区，{wait}s 后启动 ===\n")
+                    action = "保留工作区并续接原会话" if completion_mode else "重新复制干净工作区"
+                    f.write(f"\n\n=== 本轮第 {budget_attempt}/{max_attempts} 次尝试（累计 {attempt}）：{action}，{wait}s 后启动 ===\n")
                 self.store.update_side(job_id, side_name, {"attempt_count": attempt})
                 for _ in range(wait):
-                    if self._is_aborted(key):
+                    if self._is_aborted(key) or time.time() - started >= wall:
                         break
                     time.sleep(1)
                 if self._is_aborted(key):
                     break
+                if time.time() - started >= wall:
+                    result = {"code": None, "aborted": False, "new_session": None,
+                              **(result or {}), "completed": False, "failure": "单侧总运行预算用尽"}
+                    break
                 # Fresh copy from the baseline so a retry cannot mix two sessions'
                 # edits into one product (single-turn evidence integrity).
                 try:
-                    self._fresh_workspace(job_id, side_name, during_run=True)
+                    if not completion_mode:
+                        self._fresh_workspace(job_id, side_name, during_run=True)
                 except Exception as exc:
                     # Never launch into the discarded turn's dirty workspace:
                     # skip this attempt and try another re-copy after backoff.
-                    msg = (f"#{attempt}/{max_attempts} 重新复制干净工作区失败：{exc}"
+                    msg = (f"#{budget_attempt}/{max_attempts} 重新复制干净工作区失败：{exc}"
                            "（不在脏副本里启动，直接进入下一次重试）")
                     with log_path.open("a", encoding="utf-8") as f:
                         f.write(f"[retry] {msg}\n")
@@ -759,6 +881,8 @@ class PairRunner:
                 timeout=min(timeout, remaining), stall_after=stall_after, poll_every=poll_every,
                 attempt=attempt,
             )
+            if completion_mode:
+                attempts_ledger = list(self.store.get_job(job_id)["sides"][side_name].get("attempts") or [])
             self._archive_attempt(job_id, side_name, evidence_dir, {
                 **result,
                 "attempt": attempt,
@@ -774,9 +898,15 @@ class PairRunner:
                 break
             if result["completed"]:
                 break
+            if result.get("policy_failed"):
+                break
+            if managed_codex and not result.get("retryable", False):
+                with log_path.open("a", encoding="utf-8") as f:
+                    f.write("\n[retry] " + result.get("retry_stop_reason", "非临时接口错误或原因未明，停止自动重试，保留现场供检查") + "\n")
+                break
 
         result = result or {"code": -1, "new_session": None, "completed": False,
-                            "aborted": False, "summary": "未执行"}
+                            "aborted": False, "summary": "未执行", "failure": "尝试次数预算已用尽"}
         attempt_aborted = bool(result.get("aborted")) or self._is_aborted(key)
 
         patch = {
@@ -811,7 +941,7 @@ class PairRunner:
 
         job = self.store.get_job(job_id)
         commands = [ln.strip() for ln in (job.get("check_commands") or "").splitlines() if ln.strip()]
-        if attempt_aborted or self._is_aborted(key) or not commands:
+        if attempt_aborted or self._is_aborted(key) or not commands or (completion_mode and not completed):
             patch["check_results"] = []
         else:
             patch["check_results"] = run_check_commands(
@@ -833,11 +963,19 @@ class PairRunner:
                 "达到总超时" if result["code"] == 124 else
                 f"退出码={result['code']}（多为网关 504/断流）" if result["code"] not in (0, None)
                 else "未见 result:success")
-            tries = len(attempts_log)
+            tries = sum(int(row["attempt"]) > budget_start for row in attempts_ledger)
             patch["status"] = "failed"
+            if last_failure in ("单侧总运行预算用尽", "尝试次数预算已用尽"):
+                retry_note = f"本轮已尝试 {tries} 次；可手动重跑以重新获得有限运行预算"
+            else:
+                retry_note = (
+                    result.get("retry_stop_reason") or f"已停止自动重试（非临时接口错误或原因未明），本轮共尝试 {tries} 次"
+                    if managed_codex and not result.get("retryable", False)
+                    else f"本轮已尝试 {tries} 次（上限 {max_attempts}，{'保留进度续接' if completion_mode else '临时接口故障从干净基线重跑'}）仍未拿到完整轮次"
+                )
             patch["error"] = (
                 patch.get("error", "")
-                + f" {last_failure}；已尝试 {tries} 次（上限 {max_attempts}，每次断流都会换干净基线副本重跑）仍未拿到完整轮次，见 {log_path.name}"
+                + f" {last_failure}；{retry_note}，见 {log_path.name}"
             ).strip()
         elif not patch.get("session_id"):
             patch["status"] = "failed"
@@ -869,11 +1007,22 @@ class PairRunner:
             with raw_path.open("a", encoding="utf-8") as raw:
                 for line in proc.stdout:
                     raw.write(line if line.endswith("\n") else line + "\n")
+                    raw.flush()
                     if "API Error:" in line and "504" in line:
                         signal["api_error_504"] = True
                     try:
                         ev = json.loads(line)
                     except (json.JSONDecodeError, ValueError):
+                        if signal.get("agent") == "codex" and "ERROR codex_core::" in line:
+                            emit("[Codex diagnostic] " + line.strip()[:2000])
+                            # A rejected tool call is returned to the model, which
+                            # can continue the same turn. Raw diagnostics are not
+                            # terminal events and must not poison completion.
+                        continue
+                    if not isinstance(ev, dict):
+                        continue
+                    if signal.get("agent") == "codex":
+                        engines.consume_codex_event(ev, signal, emit)
                         continue
                     etype = ev.get("type")
                     # The very first stream-json event carries the authoritative
@@ -885,6 +1034,12 @@ class PairRunner:
                         signal["session_id"] = str(sid)
                     if etype == "system" and ev.get("subtype") == "init" and ev.get("cwd"):
                         signal["cwd"] = str(ev["cwd"])
+                    if etype == "system" and ev.get("subtype") == "init" and isinstance(ev.get("tools"), list):
+                        from .compliance import CLAUDE_ALLOWED_TOOLS
+                        unexpected = set(ev["tools"]) - CLAUDE_ALLOWED_TOOLS
+                        signal["tools_verified"] = bool(ev["tools"]) and not unexpected
+                        if unexpected:
+                            signal["policy_error"] = "Claude 初始化工具超出正式运行允许清单：" + ", ".join(sorted(unexpected))
                     if etype == "result":
                         signal["result"] = ev.get("subtype")
                         signal["result_is_error"] = bool(ev.get("is_error", False))
@@ -911,25 +1066,119 @@ class PairRunner:
                                         )
                                     mark = "TOOL-ERR" if c.get("is_error") else "tool-ok"
                                     emit(f"{mark} {str(body).replace(chr(10), ' ')[:200]}")
-        except Exception:
-            pass
+        except Exception as exc:
+            signal["stream_error"] = str(exc)
         finally:
             done.set()
+
+    @staticmethod
+    def _stream_session_id(path: Path) -> str:
+        try:
+            with path.open(encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(row, dict) and row.get("type") == "thread.started":
+                        return str(row.get("thread_id") or "")
+        except OSError:
+            pass
+        return ""
+
+    def _completion_resume_id(self, job: dict, side_name: str, env: dict) -> str:
+        """Bind recovery to this side's recorded id, cwd and original prompt."""
+        side = job["sides"][side_name]
+        sid = next((row["session_id"] for row in reversed(side.get("attempts") or [])
+                    if row.get("session_id")), "")
+        if not sid:
+            return ""
+        candidates = engines.find_codex_sessions(side["workspace"], env=env, session_id=sid)
+        for candidate in candidates:
+            evidence = engines.codex_evidence(candidate["path"], prompt=job["prompt"])
+            if evidence.get("session_id") == sid and engines.normalized_prompt(job["prompt"]) in evidence.get("users", []):
+                return sid
+        raise RuntimeError("无法验证本侧原会话与工作区/提示词一致；已保留文件，停止续接")
 
     def _run_attempt(
         self, job_id: str, side_name: str, wdir: str, evidence_dir: Path, log_path: Path,
         attempt_stream: Path,
         *, timeout: int, stall_after: int, poll_every: int, attempt: int,
     ) -> dict:
-        """Launch claude once under a silent-stall watchdog; return attempt result."""
-        from . import procmon
-
+        """Launch the selected CLI under the shared watchdog and process cleanup."""
+        from .cli_config import KEY_ENV
+        from .codex_relay import CodexRelay
         settings = self.store.settings()
         job = self.store.get_job(job_id)
-        prompt = job["prompt"]
+        completion_mode = _managed_codex(job) and bool(settings.get("codex_completion_recovery"))
+        agent = engines.job_engine(job)
         env = dict(os.environ)
         env.update({str(k): str(v) for k, v in (settings.get("env_overrides") or {}).items()})
-        command = settings.get("claude_command", "claude")
+        env, connection_args = self.store.cli_connections.runtime(job, env)
+        from .run_policy import preflight
+        from .compliance import POLICY_VERSION
+        capability = preflight(engines.cli_command(settings, agent), agent, env, connection_args, wdir)
+        connection_args.extend(capability.pop("extra_args", []))
+        capability["prompt_sha256"] = hashlib.sha256(job["prompt"].encode("utf-8")).hexdigest()
+        cli_home = env["CODEX_HOME" if agent == "codex" else "CLAUDE_CONFIG_DIR"]
+        if job.get("cli_home") != cli_home or job.get("execution_policy") != POLICY_VERSION:
+            job = self.store.update_job(job_id, {"cli_home": cli_home, "execution_policy": POLICY_VERSION})
+        relay = None
+        binding = job.get("cli_connection") or {}
+        if agent == "codex" and binding.get("mode") == "project":
+            proxies = {k.lower().removesuffix("_proxy"): v for k, v in env.items()
+                       if k.lower() in ("http_proxy", "https_proxy", "all_proxy", "no_proxy")}
+            relay = CodexRelay(
+                binding["base_url"], env[KEY_ENV],
+                attempt_stream.with_name(attempt_stream.stem + "-relay.jsonl"),
+                proxies=proxies or None, progress_path=log_path,
+                max_attempts=int(settings.get("codex_relay_max_attempts", 5)),
+            )
+        with relay if relay is not None else nullcontext():
+            if relay is not None:
+                # Per-process overrides: A/B retain the same on-disk config.
+                env[KEY_ENV] = relay.token
+                bypass = next((v for k, v in env.items() if k.lower() == "no_proxy"), "")
+                for name in ("NO_PROXY", "no_proxy"):
+                    env[name] = ",".join(filter(None, (bypass, "localhost", "127.0.0.1", "::1")))
+                connection_args.extend([
+                    "-c", "model_providers.pair_desk.base_url=" + json.dumps(relay.url),
+                    "-c", "model_providers.pair_desk.stream_idle_timeout_ms=960000",
+                ])
+                if completion_mode or settings.get("codex_clean_single_turn", True):
+                    retries = max(0, min(10, int(settings.get("codex_stream_max_retries", 5))))
+                    connection_args.extend(["-c", f"model_providers.pair_desk.stream_max_retries={retries}"])
+            result = self._execute_attempt(
+                job_id, side_name, wdir, evidence_dir, log_path, attempt_stream,
+                timeout=timeout, stall_after=stall_after, poll_every=poll_every,
+                attempt=attempt, settings=settings, session_job=job, env=env,
+                connection_args=connection_args,
+                capability=capability,
+            )
+            if relay is not None:
+                if relay.failure_reason and not result.get("completed"):
+                    result["failure"] = "Codex 未完成：" + relay.failure_reason
+                result["retryable"] = bool(not relay.permanent_failure.is_set()
+                                            and (completion_retryable(result) or
+                                                 (relay.exhausted.is_set() and not result.get("aborted")
+                                                  and not result.get("completed"))))
+                result["retry_stop_reason"] = (
+                    "非可恢复错误或续接预算耗尽，保留工作区与全部尝试证据"
+                    if completion_mode else
+                    "非临时接口错误或重跑预算耗尽，失败证据已保留；禁止续接提示词")
+            return result
+
+    def _execute_attempt(
+        self, job_id: str, side_name: str, wdir: str, evidence_dir: Path, log_path: Path,
+        attempt_stream: Path, *, timeout: int, stall_after: int, poll_every: int,
+        attempt: int, settings: dict, session_job: dict, env: dict,
+        connection_args: list[str], capability: dict | None = None,
+    ) -> dict:
+        job = session_job
+        agent = engines.job_engine(job)
+        prompt = job["prompt"]
+        session_job = job
+        command = engines.cli_command(settings, agent)
         # bypassPermissions: -p 非交互下 acceptEdits 只放行文件编辑，Bash 会全部
         # 自动拒绝（pair-34679bd1de A 侧 35 次 python/pytest 被拦，产物零验证）。
         # 工作区本就是一次性基线副本，可整体丢弃，放行全部工具。
@@ -938,20 +1187,55 @@ class PairRunner:
                 "--output-format", "stream-json", "--include-partial-messages",
                 "--verbose"]
         stdin_data = None
-        if len(prompt) < 1500:
-            args.append(prompt)
+        if agent == "codex":
+            args = engines.codex_args(settings, job)
+            if _managed_codex(job) and settings.get("codex_completion_recovery"):
+                resume_id = self._completion_resume_id(job, side_name, env)
+                if resume_id:
+                    # Resume appends to the rollout. Snapshot crash orphans first.
+                    ledger = list(job["sides"][side_name].get("attempts") or [])
+                    row = next((r for r in reversed(ledger) if r.get("session_id") == resume_id), None)
+                    if row is not None and not row.get("transcript_path"):
+                        source = engines.find_codex_sessions(wdir, env=env, session_id=resume_id)[0]
+                        kept = evidence_dir / "attempts" / f"{side_name.lower()}-{int(row['attempt']):02d}-{resume_id}.jsonl"
+                        kept.parent.mkdir(parents=True, exist_ok=True)
+                        if not kept.exists():
+                            shutil.copyfile(source["path"], kept)
+                        row["transcript_path"] = str(kept)
+                        self.store.update_side(job_id, side_name, {"attempts": ledger})
+                    args = engines.codex_resume_args(settings, job, resume_id)
+                    self.store.update_side(job_id, side_name, {"resumed_session_id": resume_id})
+            args[-1:-1] = connection_args
+            stdin_data = COMPLETION_PROMPT if agent == "codex" and "resume" in args[1:3] else prompt
         else:
-            stdin_data = prompt
+            args.extend(connection_args)
+            from .compliance import CLAUDE_FLAGS
+            args.extend(CLAUDE_FLAGS)
+            if job.get("claude_model"):
+                args.extend(["--model", job["claude_model"]])
+            if len(prompt) < 1500:
+                args.append(prompt)
+            else:
+                stdin_data = prompt
+
+        if capability is not None:
+            from .run_policy import write_receipt
+            write_receipt(attempt_stream.with_name(attempt_stream.stem + "-policy.json"),
+                          agent, env, capability, args)
 
         key = f"{job_id}/{side_name}"
-        baseline_mtime = self._latest_transcript_mtime(wdir)
+        baseline_mtime = (time.time() if agent == "codex" else
+                          self._latest_transcript_mtime(wdir, config_dir=job["cli_home"]) if job.get("cli_home") else
+                          self._latest_transcript_mtime(wdir))
         t0 = time.time()
         stalls = 0
         killed_reason = ""
 
         with log_path.open("a", encoding="utf-8") as logf:
+            if agent == "codex" and "resume" in args[1:3]:
+                logf.write(f"[recovery] 续接原会话 {resume_id}；保留当前工作区，额外轮次写入轨迹\n")
             if attempt == 1:
-                logf.write(f"$ claude -p --permission-mode {permission_mode} --output-format stream-json  "
+                logf.write(f"$ {engines.ENGINE_LABELS[agent]} "
                            f"[prompt via {'argv' if stdin_data is None else 'stdin'}]\n\n")
             logf.flush()
             attempt_stream.parent.mkdir(parents=True, exist_ok=True)
@@ -971,8 +1255,9 @@ class PairRunner:
             job = self._new_kill_job()
             job_ok = job.add_pid(proc.pid) if job.alive else False
             if not job_ok:
-                logf.write(f"[watchdog] Job Object 绑定不可用（{job.reason}），"
-                           "后台服务将退化为 taskkill /T 尽力清理，可能残留\n")
+                logf.write("[watchdog] Linux 独立进程组清理已启用；服务退出时 systemd 清理整个服务组\n"
+                           if os.name != "nt" else
+                           f"[watchdog] Job Object 绑定不可用（{job.reason}），后台服务将退化为 taskkill /T 尽力清理，可能残留\n")
                 logf.flush()
 
             def reap() -> None:
@@ -985,7 +1270,7 @@ class PairRunner:
             reg: Path | None = None
             try:
                 pump_done = threading.Event()
-                signal: dict = {}
+                signal: dict = {"agent": agent}
                 pump = threading.Thread(
                     target=self._pump_stream,
                     args=(proc, logf, attempt_stream, pump_done, signal),
@@ -1002,12 +1287,18 @@ class PairRunner:
                 reg.write_text(json.dumps({
                     "job_id": job_id, "side": side_name, "pid": proc.pid,
                     "workspace": wdir, "started": _stamp(),
+                    "process_start": procmon.snapshot().get(proc.pid, {}).get("start_time", ""),
                 }, ensure_ascii=False), encoding="utf-8")
                 prev_snap = procmon.snapshot()
                 idle_for = 0.0
                 last_mtime = baseline_mtime
                 code = None
                 while True:
+                    if signal.get("policy_error"):
+                        reap()
+                        _wait_proc(proc, timeout=30)
+                        killed_reason = "policy-error"
+                        break
                     if proc.poll() is not None:
                         code = proc.returncode
                         break
@@ -1032,7 +1323,15 @@ class PairRunner:
                     tree = procmon.descendants(proc.pid, cur_snap)
                     cpu_io_busy = procmon.tree_busy(prev_snap, cur_snap, tree, proc.pid)
                     stream_mtime = attempt_stream.stat().st_mtime if attempt_stream.is_file() else 0.0
-                    cur_mtime = max(self._latest_transcript_mtime(wdir), stream_mtime)
+                    if agent == "codex":
+                        cur_mtime = stream_mtime
+                        relay_log = attempt_stream.with_name(attempt_stream.stem + "-relay.jsonl")
+                        if relay_log.is_file():
+                            cur_mtime = max(cur_mtime, relay_log.stat().st_mtime)
+                    else:
+                        transcript_mtime = (self._latest_transcript_mtime(wdir, config_dir=session_job["cli_home"])
+                                            if session_job.get("cli_home") else self._latest_transcript_mtime(wdir))
+                        cur_mtime = max(transcript_mtime, stream_mtime)
                     idle_for, last_mtime = watchdog_idle_seconds(
                         idle_for, cpu_io_busy=cpu_io_busy,
                         prev_transcript_mtime=last_mtime,
@@ -1066,7 +1365,7 @@ class PairRunner:
                 try:
                     if job_ok:
                         job.terminate()
-                    elif proc.poll() is None:
+                    elif os.name != "nt" or proc.poll() is None:
                         procmon.kill_tree(proc.pid)
                 finally:
                     job.close()
@@ -1081,11 +1380,16 @@ class PairRunner:
         # whose tail is a gateway API Error or a dangling tool_result is a cut
         # turn and can never be accepted, regardless of the CLI's exit code or
         # of a trailing result:success event.
-        candidates = [
-            s for s in ws.find_session_jsonl(wdir)
-            if float(s["mtime"]) >= baseline_mtime - 1
-        ] if killed_reason != "manual-abort" else []
         init_sid = signal.get("session_id") or ""
+        if agent == "codex":
+            candidates = engines.find_codex_sessions(
+                wdir, env=env, session_id=init_sid, since=t0 - 1,
+            ) if init_sid and killed_reason != "manual-abort" else []
+        else:
+            candidates = [
+                s for s in engines.find_job_sessions(session_job, wdir, settings)
+                if float(s["mtime"]) >= baseline_mtime - 1
+            ] if killed_reason != "manual-abort" else []
         if init_sid and candidates:
             # Prefer the exact session the CLI announced in its init event;
             # mtime order alone is ambiguous when several retries share a cwd.
@@ -1096,7 +1400,20 @@ class PairRunner:
         cutoff_session = None
         cutoff_reason = ""
         for s in candidates:
-            reason = ws.transcript_interruption_reason(s["path"])
+            if agent == "codex":
+                evidence = engines.codex_evidence(s["path"], prompt=prompt,
+                    allow_recovered_turns=bool(session_job["sides"][side_name].get("completion_recovery")))
+                reason = evidence["reason"]
+                if not settings.get("codex_completion_recovery") and evidence.get("user_turn_count", len(evidence["users"])) != 1:
+                    reason = "multiple_user_turns"
+                if reason is None and engines.normalized_prompt(prompt) not in evidence["users"]:
+                    reason = "prompt_mismatch"
+            else:
+                reason = ws.transcript_interruption_reason(s["path"])
+            from .compliance import audit_trace, completion_reason
+            compliance = audit_trace(s["path"])
+            if completion_reason(compliance):
+                reason = completion_reason(compliance)
             if reason is None:
                 new_session = s
                 break
@@ -1109,9 +1426,18 @@ class PairRunner:
         # by is_error=true; and an error-during-run leaves no usable result at
         # all. Only a clean result together with a complete transcript counts.
         result_ok = signal.get("result") == "success" and not signal.get("result_is_error")
-        completed = result_ok and bool(new_session)
+        if agent == "claude" and capability is not None and result_ok and not signal.get("tools_verified"):
+            signal["policy_error"] = signal.get("policy_error") or "Claude 未提供可验证的初始化工具清单"
+        completed = result_ok and bool(new_session) and not signal.get("policy_error")
+        if agent == "codex":
+            completed = completed and code == 0 and not killed_reason and not signal.get("stream_error")
         failure = "" if completed else PairRunner._classify_attempt(
             killed_reason, code, signal, cutoff_reason, bool(candidates))
+        if agent == "codex" and not completed:
+            failure = (f"Codex 未完成：{signal.get('error_message') or killed_reason or cutoff_reason or signal.get('stream_error') or signal.get('result') or '缺少完成事件/本次 rollout'}"
+                       f"（exit={code}）")
+        if signal.get("policy_error"):
+            failure = signal["policy_error"]
         summary = (f"#{attempt} exit={code} {duration}s stalls={stalls} "
                    f"{'完成' if completed else ('有会话未完成' if new_session else '无新会话')}"
                    + (f" [原因: {failure}]" if failure else ""))
@@ -1125,6 +1451,12 @@ class PairRunner:
             "stalls": stalls, "aborted": killed_reason == "manual-abort",
             "summary": summary,
             "init_session_id": init_sid,
+            "agent": agent,
+            "retryable": bool(
+                signal.get("result") == "failed" and signal.get("retryable")
+                and not killed_reason and not signal.get("stream_error")
+            ),
+            "policy_failed": bool(cutoff_reason.startswith("extra_ai") or signal.get("policy_error")),
             # The transcript this attempt actually produced (complete or cut);
             # used by the caller to archive per-attempt evidence.
             "session_path": (chosen_for_ledger or {}).get("path", ""),
@@ -1153,6 +1485,7 @@ class PairRunner:
             transcript_path = str(kept)
         ledger.append({
             "attempt": attempt,
+            "agent": result.get("agent", engines.job_engine(self.store.get_job(job_id))),
             "started_at": result.get("started_at", ""),
             "finished_at": result.get("finished_at", ""),
             "duration_seconds": result.get("duration_seconds", 0),
@@ -1184,6 +1517,8 @@ class PairRunner:
             return "流被截断（停在工具返回后无收尾）"
         if cutoff_reason == "no_assistant":
             return "会话无模型回复（启动即断流）"
+        if cutoff_reason.startswith("extra_ai"):
+            return "轨迹合规检查未通过：" + cutoff_reason + "；保留原件，禁止标记成功"
         if signal.get("result_is_error"):
             return f"CLI 上报 result 错误（subtype={signal.get('result', '?')}）"
         if code not in (0, None):
@@ -1193,31 +1528,41 @@ class PairRunner:
         return "未见 result:success"
 
     @staticmethod
-    def _latest_transcript_mtime(wdir: str) -> float:
+    def _latest_transcript_mtime(wdir: str, *, config_dir: str = "") -> float:
         from . import procmon
-        config_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
-        return procmon.newest_jsonl_mtime(config_dir / "projects", ws._encode_cwd(wdir))
+        home = Path(config_dir or os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
+        return procmon.newest_jsonl_mtime(ws.native_path(home / "projects"), ws._encode_cwd(wdir))
 
 
     def _fresh_workspace(self, job_id: str, side_name: str, *, during_run: bool = False) -> dict:
-        """Delete one side workspace and re-copy it from the baseline (retry)."""
+        """Archive one side workspace and re-copy it from the baseline."""
         job = self.store.get_job(job_id)
         side = job["sides"][side_name]
         wdir = side.get("workspace", "") or str(
             self.store.workspace_pair_dir(job_id) / side_name.lower())
         if Path(wdir).exists():
-            ws.robust_rmtree(wdir)
-        fresh = ws.prepare_side_workspace(
-            job["baseline_repo"], wdir, side["branch"], job.get("copy_excludes", ""),
-        )
+            # Retain the failed artifact separately; never use its files as input
+            # to the next attempt, and never overwrite earlier attempt evidence.
+            archive = self.store.evidence_dir(job_id) / "discarded-workspaces"
+            archive.mkdir(parents=True, exist_ok=True)
+            destination = archive / f"{side_name.lower()}-{time.time_ns()}"
+            source = Path(wdir).resolve()
+            if source == archive.resolve() or source in archive.resolve().parents:
+                raise RuntimeError("工作区归档路径不能位于源目录内")
+            shutil.move(str(source), str(destination))
+        fresh = self._prepare_workspace(job, wdir, side["branch"])
         # during_run: keep the side visibly busy. Writing pending here is what
         # made the UI offer 「重跑」 while retry_side still saw a live worker.
         self.store.update_side(job_id, side_name, {
             "workspace": fresh["workspace"],
+            "initial_sha": fresh["head"],
             "status": "preparing" if during_run else "pending",
             "error": "",
             "head_sha": "", "head_url": "", "session_id": "", "jsonl_local": "",
             "trace_url": "", "pushed": False, "exit_code": None,
+            "video_local": "", "video_url": "", "demo": {},
+            "failure_capture": {}, "check_results": [],
+            "completion_recovery": False, "resumed_session_id": "",
             "retry_of": side.get("head_sha") or "1",
         })
         return fresh
@@ -1246,15 +1591,52 @@ class PairRunner:
             if proc is not None:
                 proc.terminate()
 
-    def retry_side(self, job_id: str, side_name: str, *, enqueue: bool = True) -> None:
-        if self.is_side_running(job_id, side_name):
-            raise RuntimeError(
-                f"{side_name} 侧正在运行，不能重跑。请先点「中止」等它结束（状态变成失败/完成）后再重跑。"
-            )
+    def retry_side(self, job_id: str, side_name: str, *, enqueue: bool = True,
+                   renew_budget: bool = True) -> None:
+        with self._lock:
+            if self.is_side_running(job_id, side_name):
+                raise RuntimeError(
+                    f"{side_name} 侧正在运行，不能重跑。请先点「中止」等它结束（状态变成失败/完成）后再重跑。"
+                )
+            job = self.store.get_job(job_id)
+            if job.get("archived") or DeskStore.review_locked(job):
+                raise RuntimeError("任务已归档或评审已锁定，请先恢复或解锁再重跑")
+            completion_mode = _managed_codex(job) and bool(self.store.settings().get("codex_completion_recovery"))
+            patch = {"status": "preparing", "error": ""}
+            if renew_budget:
+                side = job["sides"][side_name]
+                capture = side.get("failure_capture") or {}
+                if completion_mode and capture.get("origin") == "posthoc-failed-worktree":
+                    canonical = self.store.workspace_pair_dir(job_id) / side_name.lower()
+                    original = capture.get("source_workspace")
+                    if (not canonical.is_dir() or not original
+                            or Path(original).resolve() != canonical.resolve()):
+                        raise RuntimeError("失败快照的原工作区不存在或路径不一致；请关闭续接，使用干净基线重跑")
+                evidence = self.store.evidence_dir(job_id)
+                previous_attempt = max((int(row["attempt"]) for row in side.get("attempts") or []), default=0)
+                # Include a crashed attempt whose stream exists but ledger was not saved.
+                for stream in (evidence / "attempts").glob(f"{side_name.lower()}-*-stream.jsonl"):
+                    match = re.fullmatch(r"[ab]-(\d+)-stream\.jsonl", stream.name)
+                    if match:
+                        previous_attempt = max(previous_attempt, int(match[1]))
+                self.store.begin_manual_retry(job_id, side_name, previous_attempt)
+            else:
+                self.store.update_side(job_id, side_name, patch)
+        if completion_mode:
+            self.store.update_side(job_id, side_name, {"status": "pending", "error": "", "completion_recovery": True})
+            self._sync_job_status(job_id)
+            if enqueue:
+                self.enqueue(job_id)
+            return
         # Mark busy before the slow recopy so a second click cannot rmtree
         # a workspace this call or a sibling worker is currently copying.
         self.store.update_side(job_id, side_name, {"status": "preparing", "error": ""})
-        self._fresh_workspace(job_id, side_name, during_run=True)
+        try:
+            self._fresh_workspace(job_id, side_name, during_run=True)
+        except Exception as exc:
+            self.store.update_side(job_id, side_name, {"status": "failed", "error": f"重跑准备失败：{exc}"})
+            self._sync_job_status(job_id)
+            raise
         self._sync_job_status(job_id)
         if enqueue:
             self.enqueue(job_id)

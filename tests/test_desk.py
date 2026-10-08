@@ -489,17 +489,20 @@ class _FakeJob:
 
 
 @pytest.fixture(autouse=True)
-def _fake_kill_job(monkeypatch):
+def _fake_kill_job(monkeypatch, tmp_path):
     """Never create real Windows Job Objects in the unit suite."""
     from agent_trace_kit import runner as rn
     monkeypatch.setattr(rn.PairRunner, "_new_kill_job", staticmethod(_FakeJob))
+    from agent_trace_kit import run_policy
+    monkeypatch.setattr(run_policy, "preflight", lambda *a: {"capability_check": "fixture"})
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "user-home"))
 
 
 class _FakeProc:
     """Minimal subprocess.Popen double: fixed stdout lines, already exited."""
 
     def __init__(self, lines: list[str], returncode: int):
-        self.stdout = list(lines)
+        self.stdout = [json.dumps({"type": "system", "subtype": "init", "tools": ["Bash", "Read", "Write"]}) + "\n", *lines]
         self.pid = 424242
         self.returncode = returncode
 
@@ -527,9 +530,9 @@ def _run_one_attempt(store, tmp_path, transcript_path: Path,
     fake_proc = _FakeProc(stream_lines, returncode)
     monkeypatch.setattr(rn.subprocess, "Popen", lambda *a, **k: fake_proc)
     monkeypatch.setattr(ws, "find_session_jsonl",
-                        lambda w: [{"path": str(transcript_path), "session_id": "sid-x",
+                        lambda w, **kwargs: [{"path": str(transcript_path), "session_id": "sid-x",
                                     "mtime": "9999999999"}])
-    monkeypatch.setattr(rn.PairRunner, "_latest_transcript_mtime", staticmethod(lambda w: 0.0))
+    monkeypatch.setattr(rn.PairRunner, "_latest_transcript_mtime", staticmethod(lambda w, **kwargs: 0.0))
     evidence = store.evidence_dir(job_id)
     return rn.PairRunner(store)._run_attempt(
         job_id, "A", str(wdir), evidence, evidence / "a-run.log",
@@ -554,8 +557,8 @@ def test_attempt_reaps_job_on_clean_finish(tmp_path, monkeypatch):
     monkeypatch.setattr(rn.subprocess, "Popen", lambda *a, **k: fake_proc)
     monkeypatch.setattr(rn.PairRunner, "_new_kill_job", staticmethod(lambda: shared_job))
     monkeypatch.setattr(ws, "find_session_jsonl",
-                        lambda w: [{"path": str(complete), "session_id": "sid-x", "mtime": "9"}])
-    monkeypatch.setattr(rn.PairRunner, "_latest_transcript_mtime", staticmethod(lambda w: 0.0))
+                        lambda w, **kwargs: [{"path": str(complete), "session_id": "sid-x", "mtime": "9"}])
+    monkeypatch.setattr(rn.PairRunner, "_latest_transcript_mtime", staticmethod(lambda w, **kwargs: 0.0))
     evidence = store.evidence_dir(job_id)
     rn.PairRunner(store)._run_attempt(
         job_id, "A", str(wdir), evidence, evidence / "a-run.log",
@@ -568,7 +571,7 @@ def test_attempt_reaps_job_on_clean_finish(tmp_path, monkeypatch):
 
 def test_attempt_falls_back_to_taskkill_when_job_unavailable(tmp_path, monkeypatch):
     """If the process cannot be assigned to a job, cleanup closes the disabled
-    job and does NOT taskkill an already-exited PID (PID-reuse guard)."""
+    job. Windows avoids an exited PID; POSIX reaps the owned process group."""
     from agent_trace_kit import runner as rn
     from agent_trace_kit import procmon
     store = DeskStore(tmp_path / "desk")
@@ -585,8 +588,8 @@ def test_attempt_falls_back_to_taskkill_when_job_unavailable(tmp_path, monkeypat
     monkeypatch.setattr(rn.PairRunner, "_new_kill_job", staticmethod(lambda: disabled_job))
     monkeypatch.setattr(procmon, "kill_tree", lambda pid: killed.append(pid))
     monkeypatch.setattr(ws, "find_session_jsonl",
-                        lambda w: [{"path": str(complete), "session_id": "sid-x", "mtime": "9"}])
-    monkeypatch.setattr(rn.PairRunner, "_latest_transcript_mtime", staticmethod(lambda w: 0.0))
+                        lambda w, **kwargs: [{"path": str(complete), "session_id": "sid-x", "mtime": "9"}])
+    monkeypatch.setattr(rn.PairRunner, "_latest_transcript_mtime", staticmethod(lambda w, **kwargs: 0.0))
     evidence = store.evidence_dir(job_id)
     rn.PairRunner(store)._run_attempt(
         job_id, "A", str(wdir), evidence, evidence / "a-run.log",
@@ -594,7 +597,7 @@ def test_attempt_falls_back_to_taskkill_when_job_unavailable(tmp_path, monkeypat
         timeout=60, stall_after=30, poll_every=5, attempt=1)
     assert disabled_job.terminated == 0
     assert disabled_job.closed == 1
-    assert killed == []  # proc had already exited: do not recycle its PID
+    assert killed == ([] if rn.os.name == "nt" else [fake_proc.pid])
 
 
 def _result_line(is_error: bool) -> str:
@@ -643,8 +646,8 @@ def test_long_prompt_is_written_to_stdin_and_closed(tmp_path, monkeypatch):
         tmp_path / "complete.jsonl", _tool_tail_records(prompt, "完成"))
     monkeypatch.setattr(rn.subprocess, "Popen", lambda args, **kw: CapturingPopen(args, **kw))
     monkeypatch.setattr(ws, "find_session_jsonl",
-                        lambda w: [{"path": str(complete), "session_id": "sid-x", "mtime": "9"}])
-    monkeypatch.setattr(rn.PairRunner, "_latest_transcript_mtime", staticmethod(lambda w: 0.0))
+                        lambda w, **kwargs: [{"path": str(complete), "session_id": "sid-x", "mtime": "9"}])
+    monkeypatch.setattr(rn.PairRunner, "_latest_transcript_mtime", staticmethod(lambda w, **kwargs: 0.0))
     evidence = store.evidence_dir(job_id)
     rn.PairRunner(store)._run_attempt(
         job_id, "A", str(wdir), evidence, evidence / "a-run.log",
@@ -682,8 +685,8 @@ def test_abort_survives_wait_timeout_after_reap(tmp_path, monkeypatch):
     fake_proc = HungProc([], None)
     monkeypatch.setattr(rn.subprocess, "Popen", lambda *a, **k: fake_proc)
     monkeypatch.setattr(procmon, "kill_tree", lambda pid: None)
-    monkeypatch.setattr(ws, "find_session_jsonl", lambda w: [])
-    monkeypatch.setattr(rn.PairRunner, "_latest_transcript_mtime", staticmethod(lambda w: 0.0))
+    monkeypatch.setattr(ws, "find_session_jsonl", lambda w, **kwargs: [])
+    monkeypatch.setattr(rn.PairRunner, "_latest_transcript_mtime", staticmethod(lambda w, **kwargs: 0.0))
     evidence = store.evidence_dir(job_id)
     runner = rn.PairRunner(store)
     runner._abort.add(f"{job_id}/A")
@@ -719,8 +722,8 @@ def test_stall_survives_wait_timeout_after_reap(tmp_path, monkeypatch):
     monkeypatch.setattr(procmon, "snapshot", lambda: {})
     monkeypatch.setattr(procmon, "descendants", lambda *a, **k: set())
     monkeypatch.setattr(procmon, "tree_busy", lambda *a, **k: False)
-    monkeypatch.setattr(ws, "find_session_jsonl", lambda w: [])
-    monkeypatch.setattr(rn.PairRunner, "_latest_transcript_mtime", staticmethod(lambda w: 0.0))
+    monkeypatch.setattr(ws, "find_session_jsonl", lambda w, **kwargs: [])
+    monkeypatch.setattr(rn.PairRunner, "_latest_transcript_mtime", staticmethod(lambda w, **kwargs: 0.0))
     evidence = store.evidence_dir(job_id)
     out = rn.PairRunner(store)._run_attempt(
         job_id, "A", str(wdir), evidence, evidence / "a-run.log",
@@ -750,7 +753,7 @@ def test_stall_after_transcript_stops_updating(tmp_path, monkeypatch):
         def wait(self, timeout=None):
             raise subprocess.TimeoutExpired(cmd="claude", timeout=timeout or 0)
 
-    def fake_mtime(_w):
+    def fake_mtime(_w, **kwargs):
         calls["n"] += 1
         return 0.0 if calls["n"] == 1 else 100.0
 
@@ -760,7 +763,7 @@ def test_stall_after_transcript_stops_updating(tmp_path, monkeypatch):
     monkeypatch.setattr(procmon, "snapshot", lambda: {})
     monkeypatch.setattr(procmon, "descendants", lambda *a, **k: set())
     monkeypatch.setattr(procmon, "tree_busy", lambda *a, **k: False)
-    monkeypatch.setattr(ws, "find_session_jsonl", lambda w: [])
+    monkeypatch.setattr(ws, "find_session_jsonl", lambda w, **kwargs: [])
     monkeypatch.setattr(rn.PairRunner, "_latest_transcript_mtime", staticmethod(fake_mtime))
     evidence = store.evidence_dir(job_id)
     out = rn.PairRunner(store)._run_attempt(
@@ -801,8 +804,8 @@ def test_zero_stall_waits_for_process_timeout(tmp_path, monkeypatch):
     monkeypatch.setattr(procmon, "snapshot", lambda: {})
     monkeypatch.setattr(procmon, "descendants", lambda *a, **k: set())
     monkeypatch.setattr(procmon, "tree_busy", lambda *a, **k: False)
-    monkeypatch.setattr(ws, "find_session_jsonl", lambda w: [])
-    monkeypatch.setattr(rn.PairRunner, "_latest_transcript_mtime", staticmethod(lambda w: 0.0))
+    monkeypatch.setattr(ws, "find_session_jsonl", lambda w, **kwargs: [])
+    monkeypatch.setattr(rn.PairRunner, "_latest_transcript_mtime", staticmethod(lambda w, **kwargs: 0.0))
     evidence = store.evidence_dir(job_id)
     out = rn.PairRunner(store)._run_attempt(
         job_id, "A", str(wdir), evidence, evidence / "a-run.log",
@@ -928,8 +931,8 @@ def test_runner_passes_permission_mode(tmp_path, monkeypatch):
         tmp_path / "complete.jsonl", _tool_tail_records("实现一个模块", "完成"))
     monkeypatch.setattr(rn.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(ws, "find_session_jsonl",
-                        lambda w: [{"path": str(complete), "session_id": "sid-x", "mtime": "9"}])
-    monkeypatch.setattr(rn.PairRunner, "_latest_transcript_mtime", staticmethod(lambda w: 0.0))
+                        lambda w, **kwargs: [{"path": str(complete), "session_id": "sid-x", "mtime": "9"}])
+    monkeypatch.setattr(rn.PairRunner, "_latest_transcript_mtime", staticmethod(lambda w, **kwargs: 0.0))
     evidence = store.evidence_dir(job_id)
     rn.PairRunner(store)._run_attempt(
         job_id, "A", str(wdir), evidence, evidence / "a-run.log",
@@ -970,8 +973,8 @@ def test_claude_popen_hides_console(tmp_path, monkeypatch):
         tmp_path / "complete.jsonl", _tool_tail_records("实现一个模块", "完成"))
     monkeypatch.setattr(rn.subprocess, "Popen", lambda args, **kw: CapturingPopen(args, **kw))
     monkeypatch.setattr(ws, "find_session_jsonl",
-                        lambda w: [{"path": str(complete), "session_id": "sid-x", "mtime": "9"}])
-    monkeypatch.setattr(rn.PairRunner, "_latest_transcript_mtime", staticmethod(lambda w: 0.0))
+                        lambda w, **kwargs: [{"path": str(complete), "session_id": "sid-x", "mtime": "9"}])
+    monkeypatch.setattr(rn.PairRunner, "_latest_transcript_mtime", staticmethod(lambda w, **kwargs: 0.0))
     evidence = store.evidence_dir(job_id)
     rn.PairRunner(store)._run_attempt(
         job_id, "A", str(wdir), evidence, evidence / "a-run.log",
@@ -1075,7 +1078,7 @@ def test_checklist_blocks_then_passes(tmp_path, baseline_repo, monkeypatch):
     # fill the job the way the runner would after two successful sides
     snap = ws.snapshot_baseline(baseline_repo)
     pair_dir = tmp_path / "ws"
-    home = tmp_path / "claudehome"
+    home = tmp_path / "ch"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home))
     prompt = job["prompt"]
     sides = {}
@@ -1093,11 +1096,13 @@ def test_checklist_blocks_then_passes(tmp_path, baseline_repo, monkeypatch):
     for name in ("A", "B"):
         recs = [json.loads(l) for l in sides[name]["jsonl"].read_text(encoding="utf-8").splitlines()]
         recs[1]["message"]["content"][0]["text"] = prompt
+        recs[2]["message"]["model"] = ws.PINNED_MODEL
         sides[name]["jsonl"].write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in recs), encoding="utf-8")
 
     for name in ("A", "B"):
         store.update_side(job["id"], name, {
             "workspace": sides[name]["workspace"], "session_id": sides[name]["sid"],
+            "initial_sha": snap["sha"],
             "jsonl_local": str(sides[name]["jsonl"]),
             "head_sha": sides[name]["fin"]["sha"], "head_url":
             f"https://github.com/org/repo/commit/{sides[name]['fin']['sha']}",
@@ -1181,7 +1186,8 @@ def test_export_tsv_paste_row_aligns_with_feishu(tmp_path):
     assert row[0] == "我需要一个本地桌面工具，调试设备字节流。"
     assert row[1] == "徐子扬"
     assert row[2] == "0-1代码生成"
-    assert row[6] == "Windows"
+    expected_os = "MacOS/Linux" if job["os_name"] in {"Linux", "Darwin"} else job["os_name"]
+    assert row[6] == expected_os
     assert row[9] == "78533254-ab77-463e-9f63-d6935fdba919"
     assert row[12] == "https://example.com/a.mp4"
     assert row[13:15] == ["5", "A 的产物能处理异常校验并输出正确字节。"]
@@ -1199,6 +1205,9 @@ def test_delivery_quality_new_jobs_required_old_jobs_remain_blank(tmp_path):
     store = DeskStore(tmp_path / "desk")
     job = store.create_job({"prompt": "p"})
     desk = desk_mod.DeskServer(store)
+    for name in ("A", "B"):
+        trace = _write_transcript(tmp_path / f"{name}.jsonl", _tool_tail_records("p", "完成"))
+        store.update_side(job["id"], name, {"jsonl_local": str(trace)})
     review = {"job": job["id"], "validity": "有效", "conclusion": "Same",
               "reason": "两侧产物都能完成主要任务，实际运行中的边界处理也基本一致。" * 3,
               "ai_confirmed": True, "lock": True}
@@ -1215,6 +1224,9 @@ def test_delivery_quality_new_jobs_required_old_jobs_remain_blank(tmp_path):
     assert saved["review"]["b_delivery_description"] == "有具体缺陷"
 
     legacy = store.create_job({"prompt": "old"})
+    for name in ("A", "B"):
+        trace = _write_transcript(tmp_path / f"old-{name}.jsonl", _tool_tail_records("old", "完成"))
+        legacy["sides"][name]["jsonl_local"] = str(trace)
     legacy.pop("delivery_quality_required")
     legacy["review"].pop("a_delivery_score")
     legacy["review"].pop("a_delivery_description")
@@ -1251,7 +1263,7 @@ def test_checklist_voided_pair_skips_gsb_and_run_blockers(tmp_path):
                for x in cl.run_checklist(job2)["items"])
 
 
-def test_oss_sigv4_request_and_public_url():
+def test_oss_sigv4_request_and_public_url(tmp_path):
     received = {}
 
     class H(BaseHTTPRequestHandler):
@@ -1271,7 +1283,7 @@ def test_oss_sigv4_request_and_public_url():
             endpoint=f"http://127.0.0.1:{port}", bucket="bk",
             access_key_id="JDC_TEST", secret_access_key="secret", region="cn-north-1",
         )
-        f = Path(__file__).parent / "_tmp_oss.bin"
+        f = tmp_path / "oss.bin"
         f.write_bytes(b"hello-oss")
         try:
             info = oss_mod.upload_file(cfg, f, "pairwise/sid.jsonl")
@@ -1558,6 +1570,12 @@ def test_desk_csrf_and_host_defenses(tmp_path):
         assert post({"Content-Type": "application/json", "Host": "evil.example"}) == 403
         # loopback origin but a different port blocked
         assert post({"Content-Type": "application/json", "Origin": "http://127.0.0.1:9999"}) == 403
+        # SSH forwarding preserves the browser's Host and Origin, both different
+        # from the worker's actual listening port.
+        assert post({"Content-Type": "application/json", "Host": "127.0.0.1:18765",
+                     "Origin": "http://127.0.0.1:18765"}) == 200
+        assert post({"Content-Type": "application/json", "Host": "127.0.0.1:18765",
+                     "Origin": "http://127.0.0.1:9999"}) == 403
     finally:
         httpd.shutdown()
         httpd.server_close()
@@ -1584,11 +1602,11 @@ def test_runner_prefers_init_session_id_over_newest_mtime(tmp_path, monkeypatch)
     fake_proc = _FakeProc([init_line, _result_line(False)], 0)
     monkeypatch.setattr(rn.subprocess, "Popen", lambda *a, **k: fake_proc)
     # Newest-by-mtime candidate is a DIFFERENT session; the init session is older.
-    monkeypatch.setattr(ws, "find_session_jsonl", lambda w: [
+    monkeypatch.setattr(ws, "find_session_jsonl", lambda w, **kwargs: [
         {"path": str(other), "session_id": "sid-newer-noise", "mtime": "999"},
         {"path": str(complete), "session_id": "sid-init", "mtime": "1"},
     ])
-    monkeypatch.setattr(rn.PairRunner, "_latest_transcript_mtime", staticmethod(lambda w: 0.0))
+    monkeypatch.setattr(rn.PairRunner, "_latest_transcript_mtime", staticmethod(lambda w, **kwargs: 0.0))
     evidence = store.evidence_dir(job_id)
     out = rn.PairRunner(store)._run_attempt(
         job_id, "A", str(wdir), evidence, evidence / "a-run.log",
@@ -1669,7 +1687,7 @@ def test_run_side_writes_structured_attempts_ledger(tmp_path, monkeypatch):
     class FakeProc:
         def __init__(self, *a, **k):
             self.pid = 999
-            self.stdout = iter([_result_line(False)])
+            self.stdout = iter([json.dumps({"type": "system", "subtype": "init", "tools": ["Bash", "Read"]}) + "\n", _result_line(False)])
             self.returncode = 0
             self.stdin = type("S", (), {
                 "write": lambda *x: None, "flush": lambda *x: None, "close": lambda *x: None,
@@ -1689,14 +1707,14 @@ def test_run_side_writes_structured_attempts_ledger(tmp_path, monkeypatch):
         return FakeProc()
 
     # attempt 1 -> cut transcript; attempt 2 -> complete
-    def fake_find(w):
+    def fake_find(w, **kwargs):
         return [{"path": str(good if calls["n"] >= 2 else cut),
                  "session_id": "sid-good" if calls["n"] >= 2 else "sid-cut",
                  "mtime": "9"}]
 
     monkeypatch.setattr(rn.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(ws, "find_session_jsonl", fake_find)
-    monkeypatch.setattr(rn.PairRunner, "_latest_transcript_mtime", staticmethod(lambda w: 0.0))
+    monkeypatch.setattr(rn.PairRunner, "_latest_transcript_mtime", staticmethod(lambda w, **kwargs: 0.0))
     monkeypatch.setattr(rn, "retry_backoff_seconds", lambda *a, **k: 0)
     monkeypatch.setattr(rn.PairRunner, "_fresh_workspace", lambda self, j, s, **k: None)
     monkeypatch.setattr(ws, "finalize_side",
@@ -1720,6 +1738,9 @@ def test_review_lock_blocks_run_actions_server_side(tmp_path):
     store = DeskStore(tmp_path / "desk")
     job = store.create_job({"prompt": "p"})
     desk = desk_mod.DeskServer(store)
+    for name in ("A", "B"):
+        trace = _write_transcript(tmp_path / f"{name}.jsonl", _tool_tail_records("p", "完成"))
+        store.update_side(job["id"], name, {"jsonl_local": str(trace)})
 
     def expect_blocked(action_route, body):
         with pytest.raises(RuntimeError, match="锁定"):
@@ -1923,6 +1944,7 @@ def test_cligh_repo_delete_surfaces_scope_hint(monkeypatch):
 
 def test_recorder_start_passes_window_and_time_cap(tmp_path, monkeypatch):
     from agent_trace_kit import recorder as rec_mod
+    monkeypatch.setattr(rec_mod.sys, "platform", "win32")
     store = DeskStore(tmp_path / "desk")
     captured = {}
 
@@ -1944,10 +1966,10 @@ def test_recorder_start_passes_window_and_time_cap(tmp_path, monkeypatch):
     monkeypatch.setattr(rec_mod.subprocess, "Popen", fake_popen)
     rec = rec_mod.Recorder(store)
     out = rec.start("pair-x", "A", window="Chrome — 演示", max_seconds=90, fps=12)
-    assert out["max_seconds"] == 90 and out["window"] == "Chrome — 演示"
+    assert out["max_seconds"] == 89 and out["window"] == "Chrome — 演示"
     cmd = captured["cmd"]
     assert cmd[cmd.index("-i") + 1] == "title=Chrome — 演示"
-    assert cmd[cmd.index("-t") + 1] == "90"
+    assert cmd[cmd.index("-t") + 1] == "89"
     # full-screen default uses the desktop grabber
     rec.start("pair-x", "B", max_seconds=0, fps=0)
     cmd_b = captured["cmd"]
@@ -2080,11 +2102,15 @@ def test_open_shell_rejects_missing_workspace_and_bad_side(tmp_path, monkeypatch
         desk.open_shell({"job": job["id"], "side": "C"})
 
 
-def test_open_shell_requires_windows(tmp_path, monkeypatch):
+def test_open_shell_linux_returns_quoted_command(tmp_path, monkeypatch):
     from agent_trace_kit import desk as desk_mod
     monkeypatch.setattr(desk_mod.sys, "platform", "linux")
     store = DeskStore(tmp_path / "desk")
     desk = DeskServer(store)
     job = store.create_job({"prompt": "trace lab"})
-    with pytest.raises(RuntimeError, match="Windows"):
-        desk.open_shell({"job": job["id"], "side": "A"})
+    workspace = tmp_path / "work space's"
+    workspace.mkdir()
+    store.update_side(job["id"], "A", {"workspace": str(workspace)})
+    result = desk.open_shell({"job": job["id"], "side": "A"})
+    import shlex
+    assert shlex.split(result["command"]) == ["cd", "--", str(workspace.resolve())]

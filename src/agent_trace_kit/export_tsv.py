@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import io
+import re
 from pathlib import Path
 
 from . import oss as oss_mod
@@ -32,14 +33,26 @@ def _tsv_line(cells: list[str]) -> str:
 def job_row(job: dict) -> list[str]:
     a, b = job["sides"]["A"], job["sides"]["B"]
     review = job.get("review", {})
+    note = review.get("note", "")
+    source = review.get("auto_review") or {}
+    if source.get("origin") == "ai-authorized":
+        provenance = f"授权 AI 辅助评价（{source.get('model', '')}）；未作人工无 AI 声明；有效性由用户判断。"
+        if not note.startswith(provenance):
+            note = provenance + ("\n" + note if note else "")
+    prompt = job.get("prompt", "").replace("\r\n", "\n").replace("\r", "\n")
+    prompt = re.sub(r"\n(?:[ \t]*\n)+", "\n", prompt)
+    # The table groups macOS/Linux; retain the raw OS in the job for runtime routing.
+    os_name = job.get("os_name", "")
+    if os_name in {"Linux", "Darwin", "MacOS", "macOS"}:
+        os_name = "MacOS/Linux"
     return [
-        job.get("prompt", ""),
+        prompt,
         review.get("reviewer", ""),
         job.get("task_type", ""),
         job.get("harness", ""),
         job.get("difficulty", ""),
         job.get("stack", ""),
-        job.get("os_name", ""),
+        os_name,
         job.get("repro_level", ""),
         job.get("baseline_url", ""),
         a.get("session_id", ""), a.get("trace_url", ""), a.get("head_url", ""), a.get("video_url", ""),
@@ -48,12 +61,14 @@ def job_row(job: dict) -> list[str]:
         str(review.get("b_delivery_score", "")), review.get("b_delivery_description", ""),
         review.get("conclusion", ""),
         review.get("reason", ""),
-        # QC-side columns (内部质检 / 质检反馈 / 备注): left blank for reviewers.
-        "", "", "",
+        review.get("qc_status", ""), review.get("qc_feedback", ""), note,
     ]
 
 
 def export_tsv(job: dict, output: str | Path, *, strict: bool = True) -> dict:
+    if strict:
+        from .compliance import require_review_compliance
+        require_review_compliance(job)
     report = run_checklist(job, online=False)
     if strict and not report["ready"]:
         missing = [f"{x['group']}·{x['label']}" for x in report["items"] if x["blocking"] and not x["ok"]]

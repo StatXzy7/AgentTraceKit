@@ -234,7 +234,7 @@ def list_listeners() -> list[dict]:
             return _merge_listeners(*groups)
         from .procmon import run_hidden
         p = run_hidden(
-            ["ss", "-lntH"],
+            ["ss", "-lntpH"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=15,
         )
@@ -265,9 +265,7 @@ def _parse_ss(text: str) -> list[dict]:
         parts = line.split()
         if len(parts) < 4:
             continue
-        local = parts[3] if parts[0].upper() != "LISTEN" else (parts[3] if len(parts) > 3 else "")
-        if parts[0].upper() == "LISTEN":
-            local = parts[-2] if len(parts) >= 5 else parts[-1]
+        local = parts[3]
         if ":" not in local:
             continue
         host, _, port_s = local.rpartition(":")
@@ -276,7 +274,10 @@ def _parse_ss(text: str) -> list[dict]:
             port = int(port_s)
         except ValueError:
             continue
-        rows.append({"addr": host or "0.0.0.0", "port": port, "pid": 0, "name": ""})
+        owner = re.search(r'\("([^"]+)",pid=(\d+)', line)
+        rows.append({"addr": host or "0.0.0.0", "port": port,
+                     "pid": int(owner.group(2)) if owner else 0,
+                     "name": owner.group(1) if owner else ""})
     return rows
 
 
@@ -482,7 +483,7 @@ def rewrite_start_command(command: str, new_port: int) -> str:
     if "PORT=" in cmd.upper():
         return re.sub(r"PORT\s*=\s*\d+", f"PORT={new_port}", cmd, count=1, flags=re.I)
     if re.match(r"(npm|npx|node)\b", cmd, re.I):
-        return f"set PORT={new_port}&& {cmd}"
+        return f"set PORT={new_port}&& {cmd}" if sys.platform == "win32" else f"PORT={new_port} {cmd}"
     return f"{cmd}  (请把端口改成 {new_port}，不要复用已被占用的端口)"
 
 
@@ -830,6 +831,11 @@ def reap_leftover_listeners(*, keep_pids: set[int] | None = None) -> dict:
             skipped.append({"port": port, "pid": pid, "name": name, "reason": "foreign"})
             continue
         seen_pids.add(pid)
+        if sys.platform != "win32":
+            # Port number/process name alone is not proof of task ownership.
+            # Known previews stop through PreviewRegistry; CLI groups through the runner.
+            skipped.append({"port": port, "pid": pid, "name": name, "reason": "use-task-abort-or-SSH"})
+            continue
         try:
             from .procmon import run_hidden
             run_hidden(

@@ -50,6 +50,7 @@ def test_list_listeners_merges_hidden_netstat_on_windows(monkeypatch):
     import agent_trace_kit.procmon as procmon
     monkeypatch.setattr(procmon, "run_hidden", fake_hidden)
     monkeypatch.setattr(pt.sys, "platform", "win32")
+    monkeypatch.setattr(pt, "_pid_name", lambda pid: "node.exe")
     rows = pt.list_listeners()
     assert calls and calls[0][:2] == ["netstat", "-ano"]
     ports = {r["port"] for r in rows}
@@ -233,6 +234,7 @@ def test_reap_skips_keep_pids_and_foreign_names():
     import agent_trace_kit.ports as ports_mod
     import agent_trace_kit.procmon as procmon
     monkey = pytest.MonkeyPatch()
+    monkey.setattr(pt.sys, "platform", "win32")
     monkey.setattr(ports_mod, "list_listeners", lambda: rows)
     monkey.setattr(procmon, "run_hidden", fake_run)
     try:

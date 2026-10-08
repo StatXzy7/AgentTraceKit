@@ -1,0 +1,9 @@
+#!/bin/sh
+# Apply the local egress proxy only to GitHub CLI and its children.
+export HTTPS_PROXY=http://127.0.0.1:18789
+export HTTP_PROXY=http://127.0.0.1:18789
+export ALL_PROXY=http://127.0.0.1:18789
+export https_proxy="$HTTPS_PROXY" http_proxy="$HTTP_PROXY" all_proxy="$ALL_PROXY"
+export NO_PROXY=localhost,127.0.0.1,::1
+export no_proxy="$NO_PROXY"
+exec /opt/agenttracekit/runtime/bin/gh-direct "$@"

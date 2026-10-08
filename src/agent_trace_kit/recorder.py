@@ -1,23 +1,27 @@
 """Built-in screen recording for genuine product-demo videos.
 
-Two capture targets are supported, both via ffmpeg (no third-party recorder):
+Capture targets use FFmpeg:
 
 - ``window=""`` (default): full primary monitor (``gdigrab desktop``) — captures
   terminal + browser and every switch between them, which is what a real
   end-to-end verification looks like.
 - ``window="<title>"``: one OS window (``gdigrab title=...``), e.g. just the
   browser or just the terminal.
+- On Linux, the local X11 ``DISPLAY`` is captured using ``x11grab``. The
+  automatic demo worker supplies a real terminal/browser on a virtual display;
+  its report explicitly records automated provenance.
 
 The recording is the operator's real product run: they start it, demonstrate
 the product from a clean state, and stop when the run ends. An auto-stop cap
-(default 89s, just under a strict 90s boundary check) exists so a forgotten
-recording cannot run unbounded — a demo is only as long as the genuine run,
-even a few seconds is fine. Manual stop and binding an externally recorded
+(hard maximum 89s) exists so a forgotten recording cannot run unbounded. Automated
+demos include command, output-reading and final-result dwell time. Manual stop and binding an externally recorded
 mp4 remain available.
 """
 from __future__ import annotations
 
 import ctypes
+import os
+import re
 import shutil
 import subprocess
 import sys
@@ -30,8 +34,6 @@ from .checklist import video_duration_seconds
 from .desk_store import DeskStore
 
 DEFAULT_FPS = 15
-# Just under the strict 90s downstream boundary so the auto-capped file is
-# never exactly on it.
 DEFAULT_MAX_SECONDS = 89
 
 
@@ -40,6 +42,7 @@ class Recorder:
         self.store = store
         self._recs: dict[str, dict] = {}
         self._lock = threading.RLock()
+        self._results: dict[str, dict] = {}
 
     @staticmethod
     def _key(job_id: str, side: str) -> str:
@@ -98,6 +101,12 @@ class Recorder:
 
     def start(self, job_id: str, side: str, *, window: str = "",
               max_seconds: int = DEFAULT_MAX_SECONDS, fps: int = DEFAULT_FPS) -> dict:
+        if side not in ("A", "B") or not re.fullmatch(r"pair-[A-Za-z0-9-]+", job_id):
+            raise ValueError("无效的任务或侧名称")
+        linux = sys.platform.startswith("linux")
+        display = os.environ.get("DISPLAY", "")
+        if linux and (not re.fullmatch(r":\d+(?:\.\d+)?", display) or window):
+            raise RuntimeError("Linux 录屏需要本机 X11 DISPLAY（例如 :99），不支持 Windows 窗口标题")
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
             raise RuntimeError("未找到 ffmpeg，请先安装或改用「选择…」绑定已有录屏文件")
@@ -105,42 +114,54 @@ class Recorder:
             max_seconds = int(self.store.settings().get("video_max_seconds", DEFAULT_MAX_SECONDS)) or DEFAULT_MAX_SECONDS
         if fps <= 0:
             fps = int(self.store.settings().get("video_fps", DEFAULT_FPS)) or DEFAULT_FPS
+        max_seconds = max(1, min(DEFAULT_MAX_SECONDS, int(max_seconds)))
+        fps = max(1, min(30, int(fps)))
         key = self._key(job_id, side)
         with self._lock:
             cur = self._recs.get(key)
-            if cur and cur["proc"].poll() is None:
+            if cur:
                 raise RuntimeError(f"{side} 侧已在录屏中")
-
+            if linux and self._recs:
+                raise RuntimeError("Linux 桌面正在录制另一侧，请等待结束，避免 A/B 串屏")
+            # Reserve before spawning; concurrent HTTP requests cannot share X11.
+            self._recs[key] = {"proc": None}
+            self._results.pop(key, None)
         out = self._video_path(job_id, side)
-        logf = (self.store.evidence_dir(job_id) / f"{side.lower()}-video.log").open("w", encoding="utf-8")
-        if out.exists():
-            out.unlink()
-        target = f"title={window}" if window else "desktop"
+        pending = out.with_name(out.stem + ".recording.mp4")
+        target = display if linux else (f"title={window}" if window else "desktop")
         cmd = [
-            ffmpeg, "-y", "-f", "gdigrab", "-framerate", str(fps),
+            ffmpeg, "-y", "-f", "x11grab" if linux else "gdigrab", "-framerate", str(fps),
             "-i", target,
             # Hard cap: stop the genuine demo recording at the limit even if the
             # operator forgets to press stop. "-t" makes ffmpeg exit cleanly, so
             # the mp4 moov atom is still finalised.
             "-t", str(max(1, int(max_seconds))),
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
+            "-c:v", "libx264", "-threads", "2", "-preset", "ultrafast" if linux else "veryfast", "-crf", "28",
             "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-            str(out),
+            str(pending),
         ]
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        proc = subprocess.Popen(
-            cmd, stdin=subprocess.PIPE, stdout=logf, stderr=subprocess.STDOUT,
-            creationflags=creationflags,
-        )
+        logf = None
+        try:
+            logf = (self.store.evidence_dir(job_id) / f"{side.lower()}-video.log").open("w", encoding="utf-8")
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=logf, stderr=subprocess.STDOUT,
+                                    creationflags=creationflags, start_new_session=linux)
+        except Exception:
+            if logf:
+                logf.close()
+            with self._lock:
+                self._recs.pop(key, None)
+            raise
         rec = {
             "proc": proc, "path": out, "started": time.time(), "logf": logf,
             "window": window, "max_seconds": max_seconds, "auto_stopped": False,
+            "pending": pending, "done": threading.Event(),
         }
         with self._lock:
             self._recs[key] = rec
 
         def _watch():
-            proc.wait()
+            code = proc.wait()
             # ffmpeg reaching its -t cap exits on its own; mark that so the UI
             # can say "auto-stopped at the cap" rather than implying a manual stop.
             with self._lock:
@@ -151,27 +172,42 @@ class Recorder:
                 logf.close()
             except OSError:
                 pass
-            self._save(job_id, side, out)
+            try:
+                self._save(job_id, side, out, code)
+            finally:
+                rec["done"].set()
 
         threading.Thread(target=_watch, daemon=True).start()
         return {"recording": True, "path": str(out), "window": window, "max_seconds": max_seconds}
 
-    def _save(self, job_id: str, side: str, out: Path) -> dict:
+    def _save(self, job_id: str, side: str, out: Path, code: int) -> dict:
         with self._lock:
-            rec = self._recs.pop(self._key(job_id, side), None)
+            rec = self._recs.get(self._key(job_id, side))
         auto = bool(rec and rec.get("auto_stopped"))
+        pending = rec["pending"] if rec else out
+        duration = video_duration_seconds(pending) if pending.exists() else None
+        valid = code == 0 and duration is not None and 0 < duration <= DEFAULT_MAX_SECONDS
+        error = ""
+        if valid:
+            try:
+                pending.replace(out)
+                self.store.update_side(job_id, side, {"video_local": str(out), "video_url": ""})
+            except OSError as exc:
+                error = str(exc)
+        else:
+            error = f"录屏未完成或无有效视频（ffmpeg exit={code}），请检查 {side.lower()}-video.log"
         info = {
             "recording": False,
             "path": str(out) if out.exists() else "",
             "size": out.stat().st_size if out.exists() else 0,
             "duration": video_duration_seconds(out) if out.exists() else None,
             "auto_stopped": auto,
+            "error": error,
+            "exit_code": code,
         }
-        if info["size"] > 0:
-            try:
-                self.store.update_side(job_id, side, {"video_local": str(out)})
-            except (FileNotFoundError, OSError):
-                pass  # job record missing (e.g. synthetic call); file is kept anyway
+        with self._lock:
+            self._results[self._key(job_id, side)] = info
+            self._recs.pop(self._key(job_id, side), None)
         return info
 
     def stop(self, job_id: str, side: str) -> dict:
@@ -179,7 +215,7 @@ class Recorder:
         with self._lock:
             rec = self._recs.get(key)
         out = self._video_path(job_id, side)
-        if rec and rec["proc"].poll() is None:
+        if rec and rec.get("proc") and rec["proc"].poll() is None:
             try:
                 stdin = rec["proc"].stdin
                 if stdin is None:
@@ -197,27 +233,27 @@ class Recorder:
                         rec["proc"].wait(timeout=10)
                     except (subprocess.TimeoutExpired, OSError):
                         pass
-            # wait for the watcher to finalise
-            for _ in range(30):
-                with self._lock:
-                    if key not in self._recs:
-                        break
-                time.sleep(0.2)
-        return self._save(job_id, side, out)
+        if rec and rec.get("done"):
+            if not rec["done"].wait(15):
+                raise RuntimeError("录屏文件仍在收尾，请稍后查看状态")
+        return self.status(job_id, side)
 
     def status(self, job_id: str, side: str) -> dict:
         key = self._key(job_id, side)
         out = self._video_path(job_id, side)
         with self._lock:
             rec = self._recs.get(key)
-        if rec and rec["proc"].poll() is None:
+        if rec:
             return {
                 "recording": True,
-                "elapsed": int(time.time() - rec["started"]),
+                "elapsed": int(time.time() - rec.get("started", time.time())),
                 "max_seconds": rec.get("max_seconds", 0),
                 "window": rec.get("window", ""),
                 "path": str(out),
             }
+        with self._lock:
+            if key in self._results:
+                return dict(self._results[key])
         return {
             "recording": False,
             "path": str(out) if out.exists() else "",

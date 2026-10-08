@@ -1,0 +1,11 @@
+/var/lib/agenttracekit/desk/desk-service.log {
+    daily
+    maxsize 20M
+    rotate 7
+    compress
+    missingok
+    notifempty
+    copytruncate
+    su atk atk
+    create 0600 atk atk
+}

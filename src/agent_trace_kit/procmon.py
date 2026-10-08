@@ -1,4 +1,4 @@
-"""Windows process-tree activity monitoring via ctypes (no third-party deps).
+"""Process-tree monitoring on Windows (ctypes) and Linux (/proc).
 
 Used by the side-run watchdog to tell a genuinely busy claude process tree
 (model streaming output, an install/test child running) from a gateway stream
@@ -10,6 +10,8 @@ file mtime instead.
 from __future__ import annotations
 
 import ctypes
+import os
+import signal
 import subprocess
 import sys
 from ctypes import wintypes
@@ -52,6 +54,8 @@ def _ft(ft: wintypes.FILETIME) -> int:
 
 def snapshot() -> dict[int, dict]:
     """pid -> {ppid, cpu_100ns, io_bytes} for every process, best effort."""
+    if sys.platform != "win32":
+        return _snapshot_linux()
     psapi = ctypes.WinDLL("psapi.dll", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32.dll", use_last_error=True)
 
@@ -99,6 +103,31 @@ def snapshot() -> dict[int, dict]:
     # parent PIDs come from the toolhelp snapshot (single extra call)
     _fill_ppids(out)
     return out
+
+
+def _snapshot_linux() -> dict[int, dict]:
+    result = {}
+    ticks = os.sysconf("SC_CLK_TCK")
+    for path in Path("/proc").glob("[0-9]*"):
+        try:
+            raw = (path / "stat").read_text(encoding="utf-8")
+            end = raw.rindex(")")
+            fields = raw[end + 2:].split()
+            item = {
+                "ppid": int(fields[1]), "name": raw[raw.index("(") + 1:end],
+                "cpu": (int(fields[11]) + int(fields[12])) * 10_000_000 // ticks,
+                "io": 0, "start_time": fields[19], "state": fields[0],
+            }
+            try:
+                counters = dict(line.split(":", 1) for line in
+                                (path / "io").read_text(encoding="utf-8").splitlines())
+                item["io"] = int(counters.get("rchar", 0)) + int(counters.get("wchar", 0))
+            except (OSError, ValueError):
+                pass  # Other users' IO counters may be unreadable.
+            result[int(path.name)] = item
+        except (OSError, ValueError, IndexError):
+            continue  # The process can exit during a snapshot.
+    return result
 
 
 def _fill_ppids(info: dict[int, dict]) -> None:
@@ -192,7 +221,8 @@ def hidden_console_kwargs() -> dict[str, Any]:
     are unchanged, so logs and the stall watchdog still see the same pipes.
     """
     if sys.platform != "win32":
-        return {}
+        # Give each CLI/check its own process group for timeout/abort cleanup.
+        return {"start_new_session": True}
     startupinfo = subprocess.STARTUPINFO()
     startupinfo.dwFlags |= int(subprocess.STARTF_USESHOWWINDOW)
     startupinfo.wShowWindow = int(subprocess.SW_HIDE)
@@ -210,7 +240,31 @@ def run_hidden(args: Sequence[str], **kwargs: Any) -> subprocess.CompletedProces
 
 
 def kill_tree(pid: int) -> None:
-    """Kill the process and every descendant (taskkill /T /F)."""
+    """Reap the owned process group on POSIX, or taskkill /T /F on Windows."""
+    if pid <= 1 or pid == os.getpid():
+        return
+    if sys.platform != "win32":
+        try:
+            group = os.getpgid(pid)
+        except ProcessLookupError:
+            # A completed session leader may leave children in its group.
+            group = pid
+        if group == pid and group != os.getpgrp():
+            try:
+                os.killpg(group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        else:
+            # Never signal the caller's/shared process group.
+            before = snapshot()
+            for child in sorted(descendants(pid, before), reverse=True):
+                current = snapshot().get(child)
+                if current and current.get("start_time") == before[child].get("start_time"):
+                    try:
+                        os.kill(child, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+        return
     try:
         run_hidden(
             ["taskkill", "/F", "/T", "/PID", str(pid)],
@@ -226,13 +280,16 @@ def kill_tree(pid: int) -> None:
 
 def newest_jsonl_mtime(projects_dir: Path, encoded_cwd: str) -> float:
     """Newest mtime of session transcripts belonging to this workspace."""
+    from .workspace import native_path
     newest = 0.0
     if not projects_dir.is_dir():
         return newest
     needle = encoded_cwd.lower()
     for d in projects_dir.iterdir():
+        d = native_path(d)
         if d.is_dir() and needle in d.name.lower():
             for p in d.glob("*.jsonl"):
+                p = native_path(p)
                 try:
                     mtime = p.stat().st_mtime
                 except OSError:

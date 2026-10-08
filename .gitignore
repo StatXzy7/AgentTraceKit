@@ -15,3 +15,10 @@ config.toml
 *.local.toml
 # pair desk local state
 desk-state/
+.mypy_cache/
+.ruff_cache/
+# Private operator configuration and credentials.
+*.local.json
+secrets.env
+.env
+.env.*

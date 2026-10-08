@@ -13,11 +13,23 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import time
 import urllib.parse
 from pathlib import Path
 
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
+
+
+def native_path(path: str | Path) -> Path:
+    """Allow Python to read CLI-created Windows paths beyond MAX_PATH."""
+    p = Path(path)
+    if os.name == "nt":
+        value = str(p.absolute())
+        if len(value) >= 248 and not value.startswith("\\\\?\\"):
+            value = "\\\\?\\UNC\\" + value[2:] if value.startswith("\\\\") else "\\\\?\\" + value
+            return Path(value)
+    return p
 
 
 def robust_rmtree(path: str | Path, *, retries: int = 3) -> None:
@@ -38,7 +50,10 @@ def robust_rmtree(path: str | Path, *, retries: int = 3) -> None:
     target = Path(path)
     for attempt in range(retries):
         try:
-            shutil.rmtree(target, onexc=_on_exc)
+            if sys.version_info >= (3, 12):
+                shutil.rmtree(target, onexc=_on_exc)
+            else:
+                shutil.rmtree(target, onerror=_on_exc)
             return
         except FileNotFoundError:
             return
@@ -389,12 +404,22 @@ def prepare_side_workspace(
     dest: str | Path,
     branch: str,
     copy_excludes: str = "",
+    *, agent: str = "claude", baseline_sha: str = "",
 ) -> dict[str, str]:
     """Copy the prepared repo directory (including .git history) to an isolated side workspace."""
     src = Path(baseline_repo).resolve()
     dst = Path(dest).resolve()
+    if dst == src or src in dst.parents or dst in src.parents:
+        raise GitError("基线与侧工作区必须是互不包含的独立目录")
+    if baseline_sha and not is_sha40(baseline_sha):
+        raise GitError("冻结基线必须是完整的 40 位 SHA")
     if not (src / ".git").exists():
         raise GitError(f"基线目录不是 git 仓库：{src}")
+    if not (src / ".git").is_dir() or (src / ".git").is_symlink():
+        raise GitError("本地基线须使用独立 Git clone；关联 worktree 请先克隆为独立仓库")
+    tree = git(["ls-tree", "-r", baseline_sha or "HEAD"], src)[0]
+    if any(line.startswith("160000 ") for line in tree.splitlines()):
+        raise GitError("本地复制模式暂不支持子模块；请使用 GitHub 指定 commit 基线")
     if dst.exists() and any(dst.iterdir()):
         raise GitError(f"目标目录已存在且非空：{dst}")
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -408,9 +433,26 @@ def prepare_side_workspace(
         return [n for n in names if n in excludes]
 
     shutil.copytree(src, dst, ignore=ignore)
-    git(["checkout", "-B", branch], dst)
-    write_context_settings(dst)
-    _exclude_local_settings(dst)
+    copied_root = Path(git(["rev-parse", "--show-toplevel"], dst)[0].strip()).resolve()
+    if copied_root != dst:
+        raise GitError("复制后的 Git 工作树指向外部目录，拒绝修改")
+    for option in ("--absolute-git-dir", "--git-common-dir"):
+        directory = Path(git(["rev-parse", option], dst)[0].strip())
+        directory = (directory if directory.is_absolute() else dst / directory).resolve()
+        if directory != (dst / ".git").resolve():
+            raise GitError("复制后的 Git 元数据不独立，拒绝修改")
+    if baseline_sha:
+        git(["checkout", "--force", "-B", branch, baseline_sha], dst)
+        # Clean only this newly created independent copy; later baseline files
+        # must not enter a retry of an already frozen task.
+        git(["clean", "-ffdx"], dst)
+        if head_sha(dst) != baseline_sha:
+            raise GitError("侧工作区与冻结基线 SHA 不一致")
+    else:
+        git(["checkout", "-B", branch], dst)
+    if agent == "claude":
+        write_context_settings(dst)
+        _exclude_local_settings(dst)
     return {"workspace": str(dst), "branch": branch, "head": head_sha(dst)}
 
 
@@ -493,6 +535,10 @@ def transcript_interruption_reason(path: str | Path) -> str | None:
     auxiliary request 504s after the turn itself finished) is not a cut:
     that run exits non-zero but still produced a complete product.
     """
+    from .compliance import audit_trace, completion_reason
+    compliance = audit_trace(path)
+    if completion_reason(compliance):
+        return completion_reason(compliance)
     try:
         records = []
         with Path(path).open("r", encoding="utf-8", errors="replace") as f:
@@ -561,7 +607,7 @@ def session_turn_complete(path: str | Path) -> bool:
     return transcript_interruption_reason(path) in (None, "no_assistant")
 
 
-def find_session_jsonl(workspace: str | Path) -> list[dict[str, str]]:
+def find_session_jsonl(workspace: str | Path, *, config_dir: str = "") -> list[dict[str, str]]:
     """Return sessions that ran inside workspace, newest first.
 
     Every jsonl under ~/.claude/projects is matched on the ``cwd`` record
@@ -569,16 +615,18 @@ def find_session_jsonl(workspace: str | Path) -> list[dict[str, str]]:
     """
     import json
     target = str(Path(workspace).resolve()).lower()
-    home = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")).expanduser()
-    projects = home / "projects"
+    home = Path(config_dir or os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")).expanduser()
+    projects = native_path(home / "projects")
     if not projects.exists():
         return []
     encoded = _encode_cwd(workspace).lower()
     out: list[dict[str, str]] = []
     for d in projects.iterdir():
+        d = native_path(d)
         if not d.is_dir() or encoded not in d.name.lower():
             continue
         for p in d.glob("*.jsonl"):
+            p = native_path(p)
             session_id = cwd = None
             try:
                 with p.open("r", encoding="utf-8", errors="replace") as f:
